@@ -1,3 +1,30 @@
+from functools import wraps
+from flask import Response
+
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "12345678"
+
+
+def check_auth(username, password):
+    return username == ADMIN_USERNAME and password == ADMIN_PASSWORD
+
+
+def authenticate():
+    return Response(
+        "يجب تسجيل الدخول أولاً",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Login Required"'},
+    )
+
+
+def require_auth(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return func(*args, **kwargs)
+    return wrapper
 from flask import Flask, jsonify, render_template_string, request, redirect, url_for
 import json
 import sqlite3
