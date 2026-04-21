@@ -1,21 +1,37 @@
 from flask import Flask, jsonify, render_template_string, request, redirect, url_for, Response
 from functools import wraps
-import json
 from datetime import datetime, timedelta
-import uuid
+import json
 import os
+import uuid
 import psycopg2
+from psycopg2.pool import SimpleConnectionPool
 
 app = Flask(__name__)
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
 
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+
+pool = SimpleConnectionPool(
+    minconn=1,
+    maxconn=5,
+    dsn=DATABASE_URL,
+)
+
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    return pool.getconn()
+
+
+def put_conn(conn):
+    if conn:
+        pool.putconn(conn)
 
 
 def check_auth(username, password):
@@ -40,6 +56,301 @@ def require_auth(func):
     return wrapper
 
 
+def init_db():
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                id SERIAL PRIMARY KEY,
+                license_key TEXT UNIQUE NOT NULL,
+                customer_name TEXT,
+                device_ids TEXT NOT NULL DEFAULT '[]',
+                max_devices INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'active',
+                expire_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        # تحسينات وفهارس
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_licenses_key
+            ON licenses (license_key)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_licenses_status
+            ON licenses (status)
+        """)
+
+        # ترقيات آمنة لو كان الجدول قديم
+        cur.execute("""
+            ALTER TABLE licenses
+            ADD COLUMN IF NOT EXISTS customer_name TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE licenses
+            ADD COLUMN IF NOT EXISTS device_ids TEXT NOT NULL DEFAULT '[]'
+        """)
+        cur.execute("""
+            ALTER TABLE licenses
+            ADD COLUMN IF NOT EXISTS max_devices INTEGER NOT NULL DEFAULT 1
+        """)
+        cur.execute("""
+            ALTER TABLE licenses
+            ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+        """)
+        cur.execute("""
+            ALTER TABLE licenses
+            ADD COLUMN IF NOT EXISTS expire_date TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE licenses
+            ADD COLUMN IF NOT EXISTS created_at TEXT
+        """)
+
+        # تنظيف قيم فارغة قديمة
+        cur.execute("""
+            UPDATE licenses
+            SET device_ids = '[]'
+            WHERE device_ids IS NULL OR device_ids = ''
+        """)
+        cur.execute("""
+            UPDATE licenses
+            SET max_devices = 1
+            WHERE max_devices IS NULL OR max_devices < 1
+        """)
+        cur.execute("""
+            UPDATE licenses
+            SET status = 'active'
+            WHERE status IS NULL OR status = ''
+        """)
+        cur.execute("""
+            UPDATE licenses
+            SET created_at = %s
+            WHERE created_at IS NULL OR created_at = ''
+        """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),))
+
+        conn.commit()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def generate_license_key():
+    return str(uuid.uuid4()).upper().replace("-", "")[:16]
+
+
+def normalize_device_ids(raw_device_id=None, raw_device_ids=None):
+    device_ids = []
+
+    if isinstance(raw_device_ids, list):
+        device_ids.extend(raw_device_ids)
+    elif isinstance(raw_device_ids, str) and raw_device_ids.strip():
+        try:
+            parsed = json.loads(raw_device_ids)
+            if isinstance(parsed, list):
+                device_ids.extend(parsed)
+            else:
+                device_ids.append(raw_device_ids)
+        except Exception:
+            device_ids.append(raw_device_ids)
+
+    if isinstance(raw_device_id, str) and raw_device_id.strip():
+        device_ids.append(raw_device_id)
+
+    normalized = []
+    seen = set()
+
+    for item in device_ids:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+
+    return normalized
+
+
+def parse_device_ids(device_ids_json):
+    if not device_ids_json:
+        return []
+    try:
+        parsed = json.loads(device_ids_json)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def get_license(license_key):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
+            FROM licenses
+            WHERE license_key = %s
+        """, (license_key,))
+        return cur.fetchone()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def get_all_licenses():
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
+            FROM licenses
+            ORDER BY id DESC
+        """)
+        return cur.fetchall()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def create_license_record(customer_name, days, max_devices, initial_device_ids=None):
+    initial_device_ids = initial_device_ids or []
+    license_key = generate_license_key()
+    expire_date = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO licenses (
+                license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            license_key,
+            customer_name,
+            json.dumps(initial_device_ids),
+            max_devices,
+            "active",
+            expire_date,
+            created_at,
+        ))
+        conn.commit()
+        return {
+            "license_key": license_key,
+            "customer_name": customer_name,
+            "expire_date": expire_date,
+            "max_devices": max_devices,
+            "device_ids": initial_device_ids,
+            "used_devices": len(initial_device_ids),
+        }
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def save_device_ids(license_key, device_ids):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE licenses
+            SET device_ids = %s
+            WHERE license_key = %s
+        """, (json.dumps(device_ids), license_key))
+        conn.commit()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def update_license_status(license_key, new_status):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE licenses
+            SET status = %s
+            WHERE license_key = %s
+        """, (new_status, license_key))
+        conn.commit()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def update_max_devices_value(license_key, max_devices):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE licenses
+            SET max_devices = %s
+            WHERE license_key = %s
+        """, (max_devices, license_key))
+        conn.commit()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def delete_license_record(license_key):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM licenses WHERE license_key = %s", (license_key,))
+        conn.commit()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def serialize_license_row(row):
+    if not row:
+        return None
+
+    license_key, customer_name, device_ids_json, max_devices, status, expire_date, created_at = row
+    device_ids = parse_device_ids(device_ids_json)
+
+    return {
+        "license_key": license_key,
+        "customer_name": customer_name,
+        "device_ids": device_ids,
+        "used_devices": len(device_ids),
+        "max_devices": int(max_devices or 1),
+        "status": status,
+        "expire_date": expire_date,
+        "created_at": created_at,
+    }
+
+
 LICENSES_ADMIN_TEMPLATE = """
 <!doctype html>
 <html lang="ar" dir="rtl">
@@ -49,7 +360,6 @@ LICENSES_ADMIN_TEMPLATE = """
     <title>لوحة إدارة التراخيص</title>
     <style>
         :root {
-            color-scheme: light;
             --bg: #f6f3eb;
             --panel: #fffdf8;
             --line: #ddd3c3;
@@ -63,7 +373,7 @@ LICENSES_ADMIN_TEMPLATE = """
         * { box-sizing: border-box; }
         body {
             margin: 0;
-            font-family: "Segoe UI", Tahoma, sans-serif;
+            font-family: Tahoma, Arial, sans-serif;
             background: linear-gradient(135deg, #f8f4ea 0%, #ece5d6 100%);
             color: var(--text);
         }
@@ -78,18 +388,9 @@ LICENSES_ADMIN_TEMPLATE = """
             border-radius: 18px;
             box-shadow: 0 10px 30px rgba(0,0,0,.05);
         }
-        .hero {
-            padding: 22px;
-            margin-bottom: 16px;
-        }
-        .hero h1 {
-            margin: 0 0 6px;
-            font-size: 30px;
-        }
-        .hero p {
-            margin: 0;
-            color: var(--muted);
-        }
+        .hero { padding: 22px; margin-bottom: 16px; }
+        .hero h1 { margin: 0 0 6px; font-size: 30px; }
+        .hero p { margin: 0; color: var(--muted); }
         .stats {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -97,24 +398,10 @@ LICENSES_ADMIN_TEMPLATE = """
             margin: 16px 0;
         }
         .stat { padding: 16px; }
-        .stat .label {
-            color: var(--muted);
-            font-size: 13px;
-            margin-bottom: 8px;
-        }
-        .stat .value {
-            font-size: 24px;
-            font-weight: 700;
-        }
-        .card {
-            padding: 18px;
-            margin: 16px 0;
-        }
-        .card h2 {
-            margin-top: 0;
-            margin-bottom: 14px;
-            font-size: 22px;
-        }
+        .stat .label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+        .stat .value { font-size: 24px; font-weight: 700; }
+        .card { padding: 18px; margin: 16px 0; }
+        .card h2 { margin-top: 0; margin-bottom: 14px; font-size: 22px; }
         form.inline { display: inline; }
         .grid {
             display: grid;
@@ -129,10 +416,6 @@ LICENSES_ADMIN_TEMPLATE = """
             font-size: 14px;
             font-family: inherit;
         }
-        input:focus {
-            outline: none;
-            border-color: var(--accent);
-        }
         button {
             cursor: pointer;
             background: var(--accent);
@@ -140,7 +423,6 @@ LICENSES_ADMIN_TEMPLATE = """
             border: none;
             font-weight: 700;
         }
-        button:hover { opacity: .95; }
         .btn-danger { background: var(--danger); }
         .btn-warn { background: var(--warn); }
         .btn-ok { background: var(--ok); }
@@ -150,7 +432,6 @@ LICENSES_ADMIN_TEMPLATE = """
             flex-wrap: wrap;
             gap: 8px;
         }
-        .actions form { margin: 0; }
         .actions button {
             width: auto;
             min-width: 120px;
@@ -169,10 +450,7 @@ LICENSES_ADMIN_TEMPLATE = """
             vertical-align: top;
             font-size: 14px;
         }
-        th {
-            background: #f6f0e5;
-            font-size: 13px;
-        }
+        th { background: #f6f0e5; font-size: 13px; }
         tr:last-child td { border-bottom: none; }
         .devices {
             display: flex;
@@ -201,33 +479,10 @@ LICENSES_ADMIN_TEMPLATE = """
             font-size: 12px;
             font-weight: 700;
         }
-        .status.active {
-            background: #ecfdf5;
-            color: #166534;
-        }
-        .status.blocked {
-            background: #fef2f2;
-            color: #991b1b;
-        }
-        .status.expired, .status.denied {
-            background: #fff7ed;
-            color: #b45309;
-        }
+        .status.active { background: #ecfdf5; color: #166534; }
+        .status.blocked { background: #fef2f2; color: #991b1b; }
+        .status.expired, .status.denied { background: #fff7ed; color: #b45309; }
         .muted { color: var(--muted); }
-        .top-tools {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-top: 14px;
-        }
-        .top-tools a {
-            text-decoration: none;
-            background: #334155;
-            color: white;
-            padding: 10px 14px;
-            border-radius: 12px;
-            font-size: 14px;
-        }
         .flash {
             padding: 12px 14px;
             border-radius: 12px;
@@ -237,35 +492,13 @@ LICENSES_ADMIN_TEMPLATE = """
             border: 1px solid #bbf7d0;
             word-break: break-word;
         }
-        @media (max-width: 900px) {
-            table, thead, tbody, th, td, tr {
-                display: block;
-            }
-            thead { display: none; }
-            tr {
-                margin-bottom: 14px;
-                background: var(--panel);
-                border-bottom: 1px solid var(--line);
-            }
-            td::before {
-                content: attr(data-label);
-                display: block;
-                color: var(--muted);
-                font-size: 12px;
-                margin-bottom: 4px;
-            }
-        }
     </style>
 </head>
 <body>
     <div class="page">
         <section class="hero">
             <h1>لوحة إدارة التراخيص</h1>
-            <p>إدارة كاملة للمفاتيح، الأجهزة المفعلة، عدد الأجهزة المسموح، وحالة كل ترخيص.</p>
-            <div class="top-tools">
-                <a href="/admin/licenses">تحديث الصفحة</a>
-                <a href="/api/licenses" target="_blank">عرض JSON</a>
-            </div>
+            <p>التراخيص محفوظة في PostgreSQL ولن تضيع مع التحديث.</p>
         </section>
 
         {% if message %}
@@ -295,18 +528,10 @@ LICENSES_ADMIN_TEMPLATE = """
             <h2>إنشاء ترخيص جديد</h2>
             <form method="post" action="/admin/create-license">
                 <div class="grid">
-                    <div>
-                        <input type="text" name="customer_name" placeholder="اسم العميل" required>
-                    </div>
-                    <div>
-                        <input type="number" name="days" placeholder="عدد الأيام" value="30" min="1" required>
-                    </div>
-                    <div>
-                        <input type="number" name="max_devices" placeholder="عدد الأجهزة" value="1" min="1" required>
-                    </div>
-                    <div>
-                        <button type="submit">إنشاء الترخيص</button>
-                    </div>
+                    <div><input type="text" name="customer_name" placeholder="اسم العميل" required></div>
+                    <div><input type="number" name="days" placeholder="عدد الأيام" value="30" min="1" required></div>
+                    <div><input type="number" name="max_devices" placeholder="عدد الأجهزة" value="1" min="1" required></div>
+                    <div><button type="submit">إنشاء الترخيص</button></div>
                 </div>
             </form>
         </section>
@@ -328,12 +553,10 @@ LICENSES_ADMIN_TEMPLATE = """
             <tbody>
                 {% for item in licenses %}
                 <tr>
-                    <td data-label="المفتاح"><strong>{{ item.license_key }}</strong></td>
-                    <td data-label="العميل">{{ item.customer_name or '-' }}</td>
-                    <td data-label="الحالة">
-                        <span class="status {{ item.status }}">{{ item.status }}</span>
-                    </td>
-                    <td data-label="الأجهزة">
+                    <td><strong>{{ item.license_key }}</strong></td>
+                    <td>{{ item.customer_name or '-' }}</td>
+                    <td><span class="status {{ item.status }}">{{ item.status }}</span></td>
+                    <td>
                         {% if item.device_ids %}
                         <div class="devices">
                             {% for device_id in item.device_ids %}
@@ -351,10 +574,10 @@ LICENSES_ADMIN_TEMPLATE = """
                         <span class="muted">لا توجد أجهزة بعد</span>
                         {% endif %}
                     </td>
-                    <td data-label="الاستخدام">{{ item.used_devices }} / {{ item.max_devices }}</td>
-                    <td data-label="الانتهاء">{{ item.expire_date }}</td>
-                    <td data-label="الإنشاء">{{ item.created_at or '-' }}</td>
-                    <td data-label="الإدارة">
+                    <td>{{ item.used_devices }} / {{ item.max_devices }}</td>
+                    <td>{{ item.expire_date }}</td>
+                    <td>{{ item.created_at or '-' }}</td>
+                    <td>
                         <div class="actions">
                             <form method="post" action="/admin/toggle-license">
                                 <input type="hidden" name="license_key" value="{{ item.license_key }}">
@@ -396,150 +619,19 @@ LICENSES_ADMIN_TEMPLATE = """
 """
 
 
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            id SERIAL PRIMARY KEY,
-            license_key TEXT UNIQUE NOT NULL,
-            customer_name TEXT,
-            device_ids TEXT,
-            max_devices INTEGER DEFAULT 1,
-            status TEXT NOT NULL,
-            expire_date TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def generate_license_key():
-    return str(uuid.uuid4()).upper().replace("-", "")[:16]
-
-
-def normalize_device_ids(raw_device_id=None, raw_device_ids=None):
-    device_ids = []
-
-    if isinstance(raw_device_ids, list):
-        device_ids.extend(raw_device_ids)
-    elif isinstance(raw_device_ids, str) and raw_device_ids.strip():
-        device_ids.append(raw_device_ids)
-
-    if isinstance(raw_device_id, str) and raw_device_id.strip():
-        device_ids.append(raw_device_id)
-
-    normalized = []
-    seen = set()
-    for item in device_ids:
-        text = str(item or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        normalized.append(text)
-
-    return normalized
-
-
-def get_license(license_key):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        FROM licenses
-        WHERE license_key = %s
-    """, (license_key,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row
-
-
-def get_all_licenses():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        FROM licenses
-        ORDER BY id DESC
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
-
-
-def serialize_license_row(row):
-    if not row:
-        return None
-
-    license_key, customer_name, device_ids_json, max_devices, status, expire_date, created_at = row
-    device_ids = json.loads(device_ids_json) if device_ids_json else []
-    return {
-        "license_key": license_key,
-        "customer_name": customer_name,
-        "device_ids": device_ids,
-        "used_devices": len(device_ids),
-        "max_devices": max_devices,
-        "status": status,
-        "expire_date": expire_date,
-        "created_at": created_at,
-    }
-
-
-def save_device_ids(license_key, device_ids):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE licenses
-        SET device_ids = %s
-        WHERE license_key = %s
-    """, (json.dumps(device_ids), license_key))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def update_license_status(license_key, new_status):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE licenses
-        SET status = %s
-        WHERE license_key = %s
-    """, (new_status, license_key))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def update_max_devices_value(license_key, max_devices):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE licenses
-        SET max_devices = %s
-        WHERE license_key = %s
-    """, (max_devices, license_key))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def delete_license(license_key):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM licenses WHERE license_key = %s", (license_key,))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
 @app.route("/")
 def home():
-    return "License Server Running"
+    return "License Server Running (PostgreSQL)"
+
+
+@app.route("/debug-db")
+@require_auth
+def debug_db():
+    return jsonify({
+        "database_url_exists": bool(DATABASE_URL),
+        "database_engine": "postgresql",
+        "admin_user": ADMIN_USERNAME,
+    })
 
 
 @app.route("/api/create-license", methods=["POST"])
@@ -562,38 +654,8 @@ def api_create_license():
     if len(initial_device_ids) > max_devices:
         return jsonify({"status": "error", "message": "initial devices exceed max_devices"}), 400
 
-    license_key = generate_license_key()
-    expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
-    created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO licenses (
-            license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, (
-        license_key,
-        customer_name,
-        json.dumps(initial_device_ids),
-        max_devices,
-        "active",
-        expire_date,
-        created_at
-    ))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return jsonify({
-        "status": "success",
-        "license_key": license_key,
-        "customer_name": customer_name,
-        "expire_date": expire_date,
-        "max_devices": max_devices,
-        "device_ids": initial_device_ids,
-        "used_devices": len(initial_device_ids),
-    })
+    created = create_license_record(customer_name, days, max_devices, initial_device_ids)
+    return jsonify({"status": "success", **created})
 
 
 @app.route("/api/licenses", methods=["GET"])
@@ -610,8 +672,8 @@ def check_license():
     if not data:
         return jsonify({"status": "error", "message": "No data"}), 400
 
-    license_key = data.get("license_key")
-    device_id = data.get("device_id")
+    license_key = str(data.get("license_key", "")).strip()
+    device_id = str(data.get("device_id", "")).strip()
 
     if not license_key or not device_id:
         return jsonify({"status": "error", "message": "Missing data"}), 400
@@ -621,17 +683,17 @@ def check_license():
         return jsonify({"status": "invalid", "message": "License not found"}), 404
 
     _, customer_name, device_ids_json, max_devices, db_status, db_expire_date, _created_at = lic
+    device_ids = parse_device_ids(device_ids_json)
+    max_devices = int(max_devices or 1)
 
     if db_status != "active":
         return jsonify({"status": "blocked", "message": "License inactive"}), 403
 
     expire_date = datetime.strptime(db_expire_date, "%Y-%m-%d").date()
-    today = datetime.today().date()
+    today = datetime.utcnow().date()
 
     if today > expire_date:
         return jsonify({"status": "expired", "message": "License expired"}), 403
-
-    device_ids = json.loads(device_ids_json) if device_ids_json else []
 
     if device_id in device_ids:
         return jsonify({
@@ -695,43 +757,21 @@ def admin_create_license():
     if max_devices <= 0:
         return redirect(url_for("admin_licenses", message="عدد الأجهزة يجب أن يكون أكبر من صفر"))
 
-    license_key = generate_license_key()
-    expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
-    created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO licenses (
-            license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, (
-        license_key,
-        customer_name,
-        json.dumps([]),
-        max_devices,
-        "active",
-        expire_date,
-        created_at
-    ))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return redirect(url_for("admin_licenses", message=f"تم إنشاء الترخيص: {license_key}"))
+    created = create_license_record(customer_name, days, max_devices, [])
+    return redirect(url_for("admin_licenses", message=f"تم إنشاء الترخيص: {created['license_key']}"))
 
 
 @app.route("/admin/remove-device", methods=["POST"])
 @require_auth
 def admin_remove_device():
-    license_key = request.form.get("license_key")
-    device_id = request.form.get("device_id")
+    license_key = request.form.get("license_key", "").strip()
+    device_id = request.form.get("device_id", "").strip()
 
     lic = get_license(license_key)
     if not lic:
         return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
 
-    device_ids = json.loads(lic[2]) if lic[2] else []
+    device_ids = parse_device_ids(lic[2])
 
     if device_id in device_ids:
         device_ids.remove(device_id)
@@ -743,7 +783,7 @@ def admin_remove_device():
 @app.route("/admin/reset-devices", methods=["POST"])
 @require_auth
 def admin_reset_devices():
-    license_key = request.form.get("license_key")
+    license_key = request.form.get("license_key", "").strip()
     save_device_ids(license_key, [])
     return redirect(url_for("admin_licenses", message="تم تصفير الأجهزة"))
 
@@ -751,8 +791,8 @@ def admin_reset_devices():
 @app.route("/admin/toggle-license", methods=["POST"])
 @require_auth
 def admin_toggle_license():
-    license_key = request.form.get("license_key")
-    new_status = request.form.get("new_status", "blocked")
+    license_key = request.form.get("license_key", "").strip()
+    new_status = request.form.get("new_status", "blocked").strip()
 
     if new_status not in ["active", "blocked"]:
         new_status = "blocked"
@@ -764,7 +804,7 @@ def admin_toggle_license():
 @app.route("/admin/update-max-devices", methods=["POST"])
 @require_auth
 def admin_update_max_devices():
-    license_key = request.form.get("license_key")
+    license_key = request.form.get("license_key", "").strip()
     max_devices = int(request.form.get("max_devices", 1))
 
     if max_devices <= 0:
@@ -777,8 +817,8 @@ def admin_update_max_devices():
 @app.route("/admin/delete-license", methods=["POST"])
 @require_auth
 def admin_delete_license():
-    license_key = request.form.get("license_key")
-    delete_license(license_key)
+    license_key = request.form.get("license_key", "").strip()
+    delete_license_record(license_key)
     return redirect(url_for("admin_licenses", message="تم حذف الترخيص"))
 
 
