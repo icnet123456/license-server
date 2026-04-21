@@ -6,11 +6,9 @@ app = Flask(__name__)
 DB_NAME = "licenses.db"
 
 
-# إنشاء قاعدة البيانات
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS licenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,12 +18,10 @@ def init_db():
         expire_date TEXT NOT NULL
     )
     """)
-
     conn.commit()
     conn.close()
 
 
-# جلب الترخيص
 def get_license(license_key):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -38,7 +34,6 @@ def get_license(license_key):
     return row
 
 
-# تحديث الجهاز
 def update_device_id(license_key, device_id):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -50,7 +45,6 @@ def update_device_id(license_key, device_id):
     conn.close()
 
 
-# فحص الترخيص
 @app.route("/api/check-license", methods=["POST"])
 def check_license():
     data = request.get_json()
@@ -80,7 +74,6 @@ def check_license():
     if today > expire_date:
         return jsonify({"status": "expired", "message": "License expired"}), 403
 
-    # أول تفعيل
     if not db_device_id:
         update_device_id(license_key, device_id)
         return jsonify({
@@ -89,7 +82,6 @@ def check_license():
             "expire_date": db_expire_date
         })
 
-    # جهاز مختلف
     if db_device_id != device_id:
         return jsonify({
             "status": "denied",
@@ -103,13 +95,11 @@ def check_license():
     })
 
 
-# الصفحة الرئيسية
 @app.route("/")
 def home():
     return "License Server Running"
 
 
-# إضافة ترخيص تجريبي
 @app.route("/add-test-license")
 def add_test_license():
     conn = sqlite3.connect(DB_NAME)
@@ -128,5 +118,4 @@ def add_test_license():
         conn.close()
 
 
-# مهم جدًا (لتشغيل Render)
 init_db()
