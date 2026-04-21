@@ -1,8 +1,21 @@
+from flask import Flask, jsonify, render_template_string, request, redirect, url_for, Response
 from functools import wraps
-from flask import Response
+import json
+from datetime import datetime, timedelta
+import uuid
+import os
+import psycopg2
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "12345678"
+app = Flask(__name__)
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
+
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
 
 def check_auth(username, password):
@@ -25,14 +38,7 @@ def require_auth(func):
             return authenticate()
         return func(*args, **kwargs)
     return wrapper
-from flask import Flask, jsonify, render_template_string, request, redirect, url_for
-import json
-import sqlite3
-from datetime import datetime, timedelta
-import uuid
 
-app = Flask(__name__)
-DB_NAME = "licenses.db"
 
 LICENSES_ADMIN_TEMPLATE = """
 <!doctype html>
@@ -54,9 +60,7 @@ LICENSES_ADMIN_TEMPLATE = """
             --warn: #b45309;
             --ok: #166534;
         }
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
         body {
             margin: 0;
             font-family: "Segoe UI", Tahoma, sans-serif;
@@ -92,9 +96,7 @@ LICENSES_ADMIN_TEMPLATE = """
             gap: 12px;
             margin: 16px 0;
         }
-        .stat {
-            padding: 16px;
-        }
+        .stat { padding: 16px; }
         .stat .label {
             color: var(--muted);
             font-size: 13px;
@@ -113,15 +115,13 @@ LICENSES_ADMIN_TEMPLATE = """
             margin-bottom: 14px;
             font-size: 22px;
         }
-        form.inline {
-            display: inline;
-        }
+        form.inline { display: inline; }
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 12px;
         }
-        input, select, button {
+        input, button {
             width: 100%;
             padding: 11px 12px;
             border-radius: 12px;
@@ -129,7 +129,7 @@ LICENSES_ADMIN_TEMPLATE = """
             font-size: 14px;
             font-family: inherit;
         }
-        input:focus, select:focus {
+        input:focus {
             outline: none;
             border-color: var(--accent);
         }
@@ -140,29 +140,17 @@ LICENSES_ADMIN_TEMPLATE = """
             border: none;
             font-weight: 700;
         }
-        button:hover {
-            opacity: .95;
-        }
-        .btn-danger {
-            background: var(--danger);
-        }
-        .btn-warn {
-            background: var(--warn);
-        }
-        .btn-ok {
-            background: var(--ok);
-        }
-        .btn-muted {
-            background: #475569;
-        }
+        button:hover { opacity: .95; }
+        .btn-danger { background: var(--danger); }
+        .btn-warn { background: var(--warn); }
+        .btn-ok { background: var(--ok); }
+        .btn-muted { background: #475569; }
         .actions {
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
         }
-        .actions form {
-            margin: 0;
-        }
+        .actions form { margin: 0; }
         .actions button {
             width: auto;
             min-width: 120px;
@@ -185,9 +173,7 @@ LICENSES_ADMIN_TEMPLATE = """
             background: #f6f0e5;
             font-size: 13px;
         }
-        tr:last-child td {
-            border-bottom: none;
-        }
+        tr:last-child td { border-bottom: none; }
         .devices {
             display: flex;
             flex-direction: column;
@@ -227,9 +213,7 @@ LICENSES_ADMIN_TEMPLATE = """
             background: #fff7ed;
             color: #b45309;
         }
-        .muted {
-            color: var(--muted);
-        }
+        .muted { color: var(--muted); }
         .top-tools {
             display: flex;
             gap: 10px;
@@ -251,14 +235,13 @@ LICENSES_ADMIN_TEMPLATE = """
             background: #ecfdf5;
             color: #166534;
             border: 1px solid #bbf7d0;
+            word-break: break-word;
         }
         @media (max-width: 900px) {
             table, thead, tbody, th, td, tr {
                 display: block;
             }
-            thead {
-                display: none;
-            }
+            thead { display: none; }
             tr {
                 margin-bottom: 14px;
                 background: var(--panel);
@@ -414,11 +397,11 @@ LICENSES_ADMIN_TEMPLATE = """
 
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             license_key TEXT UNIQUE NOT NULL,
             customer_name TEXT,
             device_ids TEXT,
@@ -429,6 +412,7 @@ def init_db():
         )
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -460,20 +444,21 @@ def normalize_device_ids(raw_device_id=None, raw_device_ids=None):
 
 
 def get_license(license_key):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
         FROM licenses
-        WHERE license_key = ?
+        WHERE license_key = %s
     """, (license_key,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     return row
 
 
 def get_all_licenses():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
@@ -481,6 +466,7 @@ def get_all_licenses():
         ORDER BY id DESC
     """)
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
@@ -504,46 +490,50 @@ def serialize_license_row(row):
 
 
 def save_device_ids(license_key, device_ids):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         UPDATE licenses
-        SET device_ids = ?
-        WHERE license_key = ?
+        SET device_ids = %s
+        WHERE license_key = %s
     """, (json.dumps(device_ids), license_key))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def update_license_status(license_key, new_status):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         UPDATE licenses
-        SET status = ?
-        WHERE license_key = ?
+        SET status = %s
+        WHERE license_key = %s
     """, (new_status, license_key))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def update_max_devices_value(license_key, max_devices):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         UPDATE licenses
-        SET max_devices = ?
-        WHERE license_key = ?
+        SET max_devices = %s
+        WHERE license_key = %s
     """, (max_devices, license_key))
     conn.commit()
+    cur.close()
     conn.close()
 
 
 def delete_license(license_key):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM licenses WHERE license_key = ?", (license_key,))
+    cur.execute("DELETE FROM licenses WHERE license_key = %s", (license_key,))
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -553,6 +543,7 @@ def home():
 
 
 @app.route("/api/create-license", methods=["POST"])
+@require_auth
 def api_create_license():
     data = request.get_json() or {}
 
@@ -575,12 +566,12 @@ def api_create_license():
     expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
     created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO licenses (
             license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
         license_key,
         customer_name,
@@ -591,6 +582,7 @@ def api_create_license():
         created_at
     ))
     conn.commit()
+    cur.close()
     conn.close()
 
     return jsonify({
@@ -605,6 +597,7 @@ def api_create_license():
 
 
 @app.route("/api/licenses", methods=["GET"])
+@require_auth
 def api_list_licenses():
     licenses = [serialize_license_row(row) for row in get_all_licenses()]
     return jsonify({"status": "success", "count": len(licenses), "licenses": licenses})
@@ -672,6 +665,7 @@ def check_license():
 
 
 @app.route("/admin/licenses", methods=["GET"])
+@require_auth
 def admin_licenses():
     message = request.args.get("message", "")
     licenses = [serialize_license_row(row) for row in get_all_licenses()]
@@ -690,6 +684,7 @@ def admin_licenses():
 
 
 @app.route("/admin/create-license", methods=["POST"])
+@require_auth
 def admin_create_license():
     customer_name = str(request.form.get("customer_name", "Unknown") or "Unknown").strip()
     days = int(request.form.get("days", 30))
@@ -704,12 +699,12 @@ def admin_create_license():
     expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
     created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO licenses (
             license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
     """, (
         license_key,
         customer_name,
@@ -720,12 +715,14 @@ def admin_create_license():
         created_at
     ))
     conn.commit()
+    cur.close()
     conn.close()
 
     return redirect(url_for("admin_licenses", message=f"تم إنشاء الترخيص: {license_key}"))
 
 
 @app.route("/admin/remove-device", methods=["POST"])
+@require_auth
 def admin_remove_device():
     license_key = request.form.get("license_key")
     device_id = request.form.get("device_id")
@@ -744,6 +741,7 @@ def admin_remove_device():
 
 
 @app.route("/admin/reset-devices", methods=["POST"])
+@require_auth
 def admin_reset_devices():
     license_key = request.form.get("license_key")
     save_device_ids(license_key, [])
@@ -751,6 +749,7 @@ def admin_reset_devices():
 
 
 @app.route("/admin/toggle-license", methods=["POST"])
+@require_auth
 def admin_toggle_license():
     license_key = request.form.get("license_key")
     new_status = request.form.get("new_status", "blocked")
@@ -763,6 +762,7 @@ def admin_toggle_license():
 
 
 @app.route("/admin/update-max-devices", methods=["POST"])
+@require_auth
 def admin_update_max_devices():
     license_key = request.form.get("license_key")
     max_devices = int(request.form.get("max_devices", 1))
@@ -775,6 +775,7 @@ def admin_update_max_devices():
 
 
 @app.route("/admin/delete-license", methods=["POST"])
+@require_auth
 def admin_delete_license():
     license_key = request.form.get("license_key")
     delete_license(license_key)
