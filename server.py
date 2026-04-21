@@ -6,6 +6,7 @@ app = Flask(__name__)
 DB_NAME = "licenses.db"
 
 
+# إنشاء قاعدة البيانات
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -24,29 +25,44 @@ def init_db():
     conn.close()
 
 
+# جلب الترخيص
 def get_license(license_key):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("SELECT license_key, device_id, status, expire_date FROM licenses WHERE license_key = ?", (license_key,))
+    cur.execute(
+        "SELECT license_key, device_id, status, expire_date FROM licenses WHERE license_key = ?",
+        (license_key,)
+    )
     row = cur.fetchone()
     conn.close()
     return row
 
 
+# تحديث الجهاز
 def update_device_id(license_key, device_id):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("UPDATE licenses SET device_id = ? WHERE license_key = ?", (device_id, license_key))
+    cur.execute(
+        "UPDATE licenses SET device_id = ? WHERE license_key = ?",
+        (device_id, license_key)
+    )
     conn.commit()
     conn.close()
 
 
+# فحص الترخيص
 @app.route("/api/check-license", methods=["POST"])
 def check_license():
     data = request.get_json()
 
+    if not data:
+        return jsonify({"status": "error", "message": "No data"}), 400
+
     license_key = data.get("license_key")
     device_id = data.get("device_id")
+
+    if not license_key or not device_id:
+        return jsonify({"status": "error", "message": "Missing data"}), 400
 
     lic = get_license(license_key)
 
@@ -87,11 +103,30 @@ def check_license():
     })
 
 
+# الصفحة الرئيسية
 @app.route("/")
 def home():
     return "License Server Running"
 
 
-if __name__ == "__main__":
-    init_db()
-    app.run(host="0.0.0.0", port=5000)
+# إضافة ترخيص تجريبي
+@app.route("/add-test-license")
+def add_test_license():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            "INSERT INTO licenses (license_key, device_id, status, expire_date) VALUES (?, ?, ?, ?)",
+            ("ABC-123-XYZ", None, "active", "2026-12-31")
+        )
+        conn.commit()
+        return "Test license added successfully"
+    except sqlite3.IntegrityError:
+        return "License already exists"
+    finally:
+        conn.close()
+
+
+# مهم جدًا (لتشغيل Render)
+init_db()
