@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
+import uuid
+import json
 
 app = Flask(__name__)
 DB_NAME = "licenses.db"
@@ -13,36 +15,89 @@ def init_db():
     CREATE TABLE IF NOT EXISTS licenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         license_key TEXT UNIQUE NOT NULL,
-        device_id TEXT,
+        customer_name TEXT,
+        device_ids TEXT,
+        max_devices INTEGER DEFAULT 1,
         status TEXT NOT NULL,
-        expire_date TEXT NOT NULL
+        expire_date TEXT NOT NULL,
+        created_at TEXT NOT NULL
     )
     """)
     conn.commit()
     conn.close()
 
 
+def generate_license_key():
+    return str(uuid.uuid4()).upper().replace("-", "")[:16]
+
+
 def get_license(license_key):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute(
-        "SELECT license_key, device_id, status, expire_date FROM licenses WHERE license_key = ?",
-        (license_key,)
-    )
+    cur.execute("""
+        SELECT license_key, customer_name, device_ids, max_devices, status, expire_date
+        FROM licenses
+        WHERE license_key = ?
+    """, (license_key,))
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def update_device_id(license_key, device_id):
+def save_device_ids(license_key, device_ids):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE licenses SET device_id = ? WHERE license_key = ?",
-        (device_id, license_key)
-    )
+    cur.execute("""
+        UPDATE licenses
+        SET device_ids = ?
+        WHERE license_key = ?
+    """, (json.dumps(device_ids), license_key))
     conn.commit()
     conn.close()
+
+
+@app.route("/")
+def home():
+    return "License Server Running"
+
+
+@app.route("/api/create-license", methods=["POST"])
+def create_license():
+    data = request.get_json()
+
+    customer_name = data.get("customer_name", "Unknown")
+    days = int(data.get("days", 30))
+    max_devices = int(data.get("max_devices", 1))
+
+    license_key = generate_license_key()
+    expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
+    created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO licenses (
+            license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        license_key,
+        customer_name,
+        json.dumps([]),
+        max_devices,
+        "active",
+        expire_date,
+        created_at
+    ))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "status": "success",
+        "license_key": license_key,
+        "customer_name": customer_name,
+        "expire_date": expire_date,
+        "max_devices": max_devices
+    })
 
 
 @app.route("/api/check-license", methods=["POST"])
@@ -63,7 +118,7 @@ def check_license():
     if not lic:
         return jsonify({"status": "invalid", "message": "License not found"}), 404
 
-    db_license_key, db_device_id, db_status, db_expire_date = lic
+    db_license_key, customer_name, device_ids_json, max_devices, db_status, db_expire_date = lic
 
     if db_status != "active":
         return jsonify({"status": "blocked", "message": "License inactive"}), 403
@@ -74,48 +129,37 @@ def check_license():
     if today > expire_date:
         return jsonify({"status": "expired", "message": "License expired"}), 403
 
-    if not db_device_id:
-        update_device_id(license_key, device_id)
+    device_ids = json.loads(device_ids_json) if device_ids_json else []
+
+    if device_id in device_ids:
         return jsonify({
             "status": "active",
-            "message": "Activated",
-            "expire_date": db_expire_date
+            "message": "Valid",
+            "customer_name": customer_name,
+            "expire_date": db_expire_date,
+            "max_devices": max_devices,
+            "used_devices": len(device_ids)
         })
 
-    if db_device_id != device_id:
+    if len(device_ids) >= max_devices:
         return jsonify({
             "status": "denied",
-            "message": "Used on another device"
+            "message": "Device limit reached",
+            "customer_name": customer_name,
+            "expire_date": db_expire_date
         }), 403
+
+    device_ids.append(device_id)
+    save_device_ids(license_key, device_ids)
 
     return jsonify({
         "status": "active",
-        "message": "Valid",
-        "expire_date": db_expire_date
+        "message": "Activated",
+        "customer_name": customer_name,
+        "expire_date": db_expire_date,
+        "max_devices": max_devices,
+        "used_devices": len(device_ids)
     })
-
-
-@app.route("/")
-def home():
-    return "License Server Running"
-
-
-@app.route("/add-test-license")
-def add_test_license():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-
-    try:
-        cur.execute(
-            "INSERT INTO licenses (license_key, device_id, status, expire_date) VALUES (?, ?, ?, ?)",
-            ("ABC-123-XYZ", None, "active", "2026-12-31")
-        )
-        conn.commit()
-        return "Test license added successfully"
-    except sqlite3.IntegrityError:
-        return "License already exists"
-    finally:
-        conn.close()
 
 
 init_db()
