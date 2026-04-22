@@ -10,13 +10,13 @@ from psycopg2.pool import SimpleConnectionPool
 app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "12345678")
 
+TRIAL_DAYS = 7
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
-
 
 pool = SimpleConnectionPool(
     minconn=1,
@@ -76,7 +76,17 @@ def init_db():
             )
         """)
 
-        # تحسينات وفهارس
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trial_users (
+                id SERIAL PRIMARY KEY,
+                device_id TEXT UNIQUE NOT NULL,
+                start_date TEXT NOT NULL,
+                expire_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL
+            )
+        """)
+
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_licenses_key
             ON licenses (license_key)
@@ -87,53 +97,10 @@ def init_db():
             ON licenses (status)
         """)
 
-        # ترقيات آمنة لو كان الجدول قديم
         cur.execute("""
-            ALTER TABLE licenses
-            ADD COLUMN IF NOT EXISTS customer_name TEXT
+            CREATE INDEX IF NOT EXISTS idx_trial_device
+            ON trial_users (device_id)
         """)
-        cur.execute("""
-            ALTER TABLE licenses
-            ADD COLUMN IF NOT EXISTS device_ids TEXT NOT NULL DEFAULT '[]'
-        """)
-        cur.execute("""
-            ALTER TABLE licenses
-            ADD COLUMN IF NOT EXISTS max_devices INTEGER NOT NULL DEFAULT 1
-        """)
-        cur.execute("""
-            ALTER TABLE licenses
-            ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
-        """)
-        cur.execute("""
-            ALTER TABLE licenses
-            ADD COLUMN IF NOT EXISTS expire_date TEXT
-        """)
-        cur.execute("""
-            ALTER TABLE licenses
-            ADD COLUMN IF NOT EXISTS created_at TEXT
-        """)
-
-        # تنظيف قيم فارغة قديمة
-        cur.execute("""
-            UPDATE licenses
-            SET device_ids = '[]'
-            WHERE device_ids IS NULL OR device_ids = ''
-        """)
-        cur.execute("""
-            UPDATE licenses
-            SET max_devices = 1
-            WHERE max_devices IS NULL OR max_devices < 1
-        """)
-        cur.execute("""
-            UPDATE licenses
-            SET status = 'active'
-            WHERE status IS NULL OR status = ''
-        """)
-        cur.execute("""
-            UPDATE licenses
-            SET created_at = %s
-            WHERE created_at IS NULL OR created_at = ''
-        """, (datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),))
 
         conn.commit()
     finally:
@@ -216,6 +183,42 @@ def get_all_licenses():
         cur.execute("""
             SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
             FROM licenses
+            ORDER BY id DESC
+        """)
+        return cur.fetchall()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def get_trial(device_id):
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT device_id, start_date, expire_date, status, created_at
+            FROM trial_users
+            WHERE device_id = %s
+        """, (device_id,))
+        return cur.fetchone()
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
+def get_all_trials():
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT device_id, start_date, expire_date, status, created_at
+            FROM trial_users
             ORDER BY id DESC
         """)
         return cur.fetchall()
@@ -332,6 +335,41 @@ def delete_license_record(license_key):
         put_conn(conn)
 
 
+def create_trial_record(device_id, days=TRIAL_DAYS):
+    start_date = datetime.utcnow().date()
+    expire_date = start_date + timedelta(days=days)
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = None
+    cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO trial_users (
+                device_id, start_date, expire_date, status, created_at
+            ) VALUES (%s, %s, %s, %s, %s)
+        """, (
+            device_id,
+            start_date.strftime("%Y-%m-%d"),
+            expire_date.strftime("%Y-%m-%d"),
+            "active",
+            created_at,
+        ))
+        conn.commit()
+        return {
+            "device_id": device_id,
+            "start_date": start_date.strftime("%Y-%m-%d"),
+            "expire_date": expire_date.strftime("%Y-%m-%d"),
+            "days_left": days,
+            "status": "trial_active",
+        }
+    finally:
+        if cur:
+            cur.close()
+        put_conn(conn)
+
+
 def serialize_license_row(row):
     if not row:
         return None
@@ -347,6 +385,20 @@ def serialize_license_row(row):
         "max_devices": int(max_devices or 1),
         "status": status,
         "expire_date": expire_date,
+        "created_at": created_at,
+    }
+
+
+def serialize_trial_row(row):
+    if not row:
+        return None
+
+    device_id, start_date, expire_date, status, created_at = row
+    return {
+        "device_id": device_id,
+        "start_date": start_date,
+        "expire_date": expire_date,
+        "status": status,
         "created_at": created_at,
     }
 
@@ -378,7 +430,7 @@ LICENSES_ADMIN_TEMPLATE = """
             color: var(--text);
         }
         .page {
-            max-width: 1250px;
+            max-width: 1280px;
             margin: 24px auto;
             padding: 0 16px 40px;
         }
@@ -402,7 +454,6 @@ LICENSES_ADMIN_TEMPLATE = """
         .stat .value { font-size: 24px; font-weight: 700; }
         .card { padding: 18px; margin: 16px 0; }
         .card h2 { margin-top: 0; margin-bottom: 14px; font-size: 22px; }
-        form.inline { display: inline; }
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -442,6 +493,7 @@ LICENSES_ADMIN_TEMPLATE = """
             width: 100%;
             border-collapse: collapse;
             overflow: hidden;
+            margin-top: 12px;
         }
         th, td {
             padding: 13px 10px;
@@ -452,17 +504,6 @@ LICENSES_ADMIN_TEMPLATE = """
         }
         th { background: #f6f0e5; font-size: 13px; }
         tr:last-child td { border-bottom: none; }
-        .devices {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-        .device-row {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
         .device-tag {
             background: #ecfeff;
             color: #155e75;
@@ -470,6 +511,8 @@ LICENSES_ADMIN_TEMPLATE = """
             border-radius: 999px;
             padding: 5px 10px;
             font-size: 12px;
+            display: inline-block;
+            margin: 3px 0;
             word-break: break-all;
         }
         .status {
@@ -481,8 +524,8 @@ LICENSES_ADMIN_TEMPLATE = """
         }
         .status.active { background: #ecfdf5; color: #166534; }
         .status.blocked { background: #fef2f2; color: #991b1b; }
-        .status.expired, .status.denied { background: #fff7ed; color: #b45309; }
-        .muted { color: var(--muted); }
+        .status.trial_active { background: #eff6ff; color: #1d4ed8; }
+        .status.trial_expired { background: #fff7ed; color: #b45309; }
         .flash {
             padding: 12px 14px;
             border-radius: 12px;
@@ -498,7 +541,7 @@ LICENSES_ADMIN_TEMPLATE = """
     <div class="page">
         <section class="hero">
             <h1>لوحة إدارة التراخيص</h1>
-            <p>التراخيص محفوظة في PostgreSQL ولن تضيع مع التحديث.</p>
+            <p>التراخيص محفوظة في PostgreSQL + تجربة مجانية 7 أيام.</p>
         </section>
 
         {% if message %}
@@ -519,8 +562,8 @@ LICENSES_ADMIN_TEMPLATE = """
                 <div class="value">{{ active_licenses }}</div>
             </div>
             <div class="card stat">
-                <div class="label">التراخيص الموقوفة</div>
-                <div class="value">{{ blocked_licenses }}</div>
+                <div class="label">أجهزة التجربة</div>
+                <div class="value">{{ trials|length }}</div>
             </div>
         </section>
 
@@ -536,83 +579,110 @@ LICENSES_ADMIN_TEMPLATE = """
             </form>
         </section>
 
-        {% if licenses %}
-        <table>
-            <thead>
-                <tr>
-                    <th>المفتاح</th>
-                    <th>العميل</th>
-                    <th>الحالة</th>
-                    <th>الأجهزة</th>
-                    <th>الاستخدام</th>
-                    <th>الانتهاء</th>
-                    <th>الإنشاء</th>
-                    <th>الإدارة</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for item in licenses %}
-                <tr>
-                    <td><strong>{{ item.license_key }}</strong></td>
-                    <td>{{ item.customer_name or '-' }}</td>
-                    <td><span class="status {{ item.status }}">{{ item.status }}</span></td>
-                    <td>
-                        {% if item.device_ids %}
-                        <div class="devices">
-                            {% for device_id in item.device_ids %}
-                            <div class="device-row">
-                                <span class="device-tag">{{ device_id }}</span>
-                                <form class="inline" method="post" action="/admin/remove-device">
+        <section class="card">
+            <h2>التراخيص</h2>
+            {% if licenses %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>المفتاح</th>
+                        <th>العميل</th>
+                        <th>الحالة</th>
+                        <th>الأجهزة</th>
+                        <th>الاستخدام</th>
+                        <th>الانتهاء</th>
+                        <th>الإنشاء</th>
+                        <th>الإدارة</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for item in licenses %}
+                    <tr>
+                        <td><strong>{{ item.license_key }}</strong></td>
+                        <td>{{ item.customer_name or '-' }}</td>
+                        <td><span class="status {{ item.status }}">{{ item.status }}</span></td>
+                        <td>
+                            {% if item.device_ids %}
+                                {% for device_id in item.device_ids %}
+                                    <div class="device-tag">{{ device_id }}</div>
+                                    <form method="post" action="/admin/remove-device" style="margin-top:4px;">
+                                        <input type="hidden" name="license_key" value="{{ item.license_key }}">
+                                        <input type="hidden" name="device_id" value="{{ device_id }}">
+                                        <button type="submit" class="btn-danger">حذف هذا الجهاز</button>
+                                    </form>
+                                {% endfor %}
+                            {% else %}
+                                لا توجد أجهزة
+                            {% endif %}
+                        </td>
+                        <td>{{ item.used_devices }} / {{ item.max_devices }}</td>
+                        <td>{{ item.expire_date }}</td>
+                        <td>{{ item.created_at }}</td>
+                        <td>
+                            <div class="actions">
+                                <form method="post" action="/admin/toggle-license">
                                     <input type="hidden" name="license_key" value="{{ item.license_key }}">
-                                    <input type="hidden" name="device_id" value="{{ device_id }}">
-                                    <button type="submit" class="btn-danger">حذف هذا الجهاز</button>
+                                    <input type="hidden" name="new_status" value="{{ 'blocked' if item.status == 'active' else 'active' }}">
+                                    <button type="submit" class="{{ 'btn-warn' if item.status == 'active' else 'btn-ok' }}">
+                                        {{ 'إيقاف' if item.status == 'active' else 'تفعيل' }}
+                                    </button>
+                                </form>
+
+                                <form method="post" action="/admin/reset-devices">
+                                    <input type="hidden" name="license_key" value="{{ item.license_key }}">
+                                    <button type="submit" class="btn-muted">تصفير الأجهزة</button>
+                                </form>
+
+                                <form method="post" action="/admin/delete-license" onsubmit="return confirm('هل تريد حذف الترخيص نهائيًا؟');">
+                                    <input type="hidden" name="license_key" value="{{ item.license_key }}">
+                                    <button type="submit" class="btn-danger">حذف الترخيص</button>
+                                </form>
+
+                                <form method="post" action="/admin/update-max-devices">
+                                    <input type="hidden" name="license_key" value="{{ item.license_key }}">
+                                    <input type="number" name="max_devices" value="{{ item.max_devices }}" min="1" style="width: 100px;">
+                                    <button type="submit">تحديث الأجهزة</button>
                                 </form>
                             </div>
-                            {% endfor %}
-                        </div>
-                        {% else %}
-                        <span class="muted">لا توجد أجهزة بعد</span>
-                        {% endif %}
-                    </td>
-                    <td>{{ item.used_devices }} / {{ item.max_devices }}</td>
-                    <td>{{ item.expire_date }}</td>
-                    <td>{{ item.created_at or '-' }}</td>
-                    <td>
-                        <div class="actions">
-                            <form method="post" action="/admin/toggle-license">
-                                <input type="hidden" name="license_key" value="{{ item.license_key }}">
-                                <input type="hidden" name="new_status" value="{{ 'blocked' if item.status == 'active' else 'active' }}">
-                                <button type="submit" class="{{ 'btn-warn' if item.status == 'active' else 'btn-ok' }}">
-                                    {{ 'إيقاف' if item.status == 'active' else 'تفعيل' }}
-                                </button>
-                            </form>
-
-                            <form method="post" action="/admin/reset-devices">
-                                <input type="hidden" name="license_key" value="{{ item.license_key }}">
-                                <button type="submit" class="btn-muted">تصفير الأجهزة</button>
-                            </form>
-
-                            <form method="post" action="/admin/delete-license" onsubmit="return confirm('هل تريد حذف الترخيص نهائيًا؟');">
-                                <input type="hidden" name="license_key" value="{{ item.license_key }}">
-                                <button type="submit" class="btn-danger">حذف الترخيص</button>
-                            </form>
-
-                            <form method="post" action="/admin/update-max-devices">
-                                <input type="hidden" name="license_key" value="{{ item.license_key }}">
-                                <input type="number" name="max_devices" value="{{ item.max_devices }}" min="1" style="width: 100px;">
-                                <button type="submit">تحديث الأجهزة</button>
-                            </form>
-                        </div>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <section class="card">
-            <div class="muted">لا توجد تراخيص محفوظة بعد.</div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+                <p>لا توجد تراخيص بعد.</p>
+            {% endif %}
         </section>
-        {% endif %}
+
+        <section class="card">
+            <h2>أجهزة النسخة التجريبية</h2>
+            {% if trials %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>معرف الجهاز</th>
+                        <th>بداية التجربة</th>
+                        <th>نهاية التجربة</th>
+                        <th>الحالة</th>
+                        <th>الإنشاء</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for trial in trials %}
+                    <tr>
+                        <td>{{ trial.device_id }}</td>
+                        <td>{{ trial.start_date }}</td>
+                        <td>{{ trial.expire_date }}</td>
+                        <td><span class="status {{ trial.status }}">{{ trial.status }}</span></td>
+                        <td>{{ trial.created_at }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+                <p>لا توجد أجهزة Trial بعد.</p>
+            {% endif %}
+        </section>
     </div>
 </body>
 </html>
@@ -621,7 +691,7 @@ LICENSES_ADMIN_TEMPLATE = """
 
 @app.route("/")
 def home():
-    return "License Server Running (PostgreSQL)"
+    return "License Server Running (PostgreSQL + Trial)"
 
 
 @app.route("/debug-db")
@@ -630,6 +700,7 @@ def debug_db():
     return jsonify({
         "database_url_exists": bool(DATABASE_URL),
         "database_engine": "postgresql",
+        "trial_days": TRIAL_DAYS,
         "admin_user": ADMIN_USERNAME,
     })
 
@@ -663,6 +734,46 @@ def api_create_license():
 def api_list_licenses():
     licenses = [serialize_license_row(row) for row in get_all_licenses()]
     return jsonify({"status": "success", "count": len(licenses), "licenses": licenses})
+
+
+@app.route("/api/start-trial", methods=["POST"])
+def start_trial():
+    data = request.get_json() or {}
+    device_id = str(data.get("device_id", "")).strip()
+
+    if not device_id:
+        return jsonify({"status": "error", "message": "device_id required"}), 400
+
+    row = get_trial(device_id)
+    today = datetime.utcnow().date()
+
+    if row:
+        _, start_date, expire_date, status, _created_at = row
+        expire_obj = datetime.strptime(expire_date, "%Y-%m-%d").date()
+
+        if today > expire_obj:
+            return jsonify({
+                "status": "trial_expired",
+                "message": "Trial expired",
+                "expire_date": expire_date,
+                "days_left": 0
+            }), 403
+
+        days_left = (expire_obj - today).days
+        return jsonify({
+            "status": "trial_active",
+            "message": "Trial already active",
+            "expire_date": expire_date,
+            "days_left": days_left
+        })
+
+    result = create_trial_record(device_id, TRIAL_DAYS)
+    return jsonify({
+        "status": "trial_active",
+        "message": "Trial started successfully",
+        "expire_date": result["expire_date"],
+        "days_left": result["days_left"]
+    })
 
 
 @app.route("/api/check-license", methods=["POST"])
@@ -731,16 +842,16 @@ def check_license():
 def admin_licenses():
     message = request.args.get("message", "")
     licenses = [serialize_license_row(row) for row in get_all_licenses()]
+    trials = [serialize_trial_row(row) for row in get_all_trials()]
     total_devices = sum(item["used_devices"] for item in licenses)
     active_licenses = sum(1 for item in licenses if item["status"] == "active")
-    blocked_licenses = sum(1 for item in licenses if item["status"] == "blocked")
 
     return render_template_string(
         LICENSES_ADMIN_TEMPLATE,
         licenses=licenses,
+        trials=trials,
         total_devices=total_devices,
         active_licenses=active_licenses,
-        blocked_licenses=blocked_licenses,
         message=message,
     )
 
