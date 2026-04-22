@@ -2,7 +2,10 @@ services:
   - type: web
     name: cardgenerator-license-server
     runtime: python
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
     plan: free
-    buildCommand: pip install -r server_requirements.txt
+    buildCommand: python -m pip install --upgrade pip setuptools wheel && pip install -r server_requirements.txt
     startCommand: gunicorn server:app
     autoDeploy: true
