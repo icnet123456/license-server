@@ -472,6 +472,19 @@ def get_all_licenses():
     return rows
 
 
+def find_license_by_device(device_id):
+    normalized_device_id = str(device_id or "").strip()
+    if not normalized_device_id:
+        return None
+
+    for row in get_all_licenses():
+        device_ids_json = row[2]
+        device_ids = json.loads(device_ids_json) if device_ids_json else []
+        if normalized_device_id in device_ids:
+            return row
+    return None
+
+
 def get_trial(device_id):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
@@ -589,6 +602,7 @@ def get_server_meta():
         "database": DB_NAME,
         "features": [
             "license_activation",
+            "device_activation_lookup",
             "trial_start",
             "trial_check",
             "admin_dashboard",
@@ -833,6 +847,50 @@ def check_license():
         "expire_date": db_expire_date,
         "max_devices": max_devices,
         "used_devices": len(device_ids),
+    })
+
+
+@app.route("/api/check-device", methods=["POST"])
+def check_device_activation():
+    data = request.get_json() or {}
+    device_id = str(data.get("device_id", "") or "").strip()
+
+    if not device_id:
+        return jsonify({"status": "error", "message": "Missing device_id"}), 400
+
+    lic = find_license_by_device(device_id)
+    if not lic:
+        return jsonify({"status": "not_found", "message": "Device is not linked to any license"}), 404
+
+    _license_key, customer_name, device_ids_json, max_devices, db_status, db_expire_date, _created_at = lic
+
+    if db_status != "active":
+        return jsonify({
+            "status": "blocked",
+            "message": "License inactive",
+            "customer_name": customer_name,
+            "expire_date": db_expire_date,
+        }), 403
+
+    expire_date = datetime.strptime(db_expire_date, "%Y-%m-%d").date()
+    today = datetime.today().date()
+    if today > expire_date:
+        return jsonify({
+            "status": "expired",
+            "message": "License expired",
+            "customer_name": customer_name,
+            "expire_date": db_expire_date,
+        }), 403
+
+    device_ids = json.loads(device_ids_json) if device_ids_json else []
+    return jsonify({
+        "status": "active",
+        "message": "Device activation valid",
+        "customer_name": customer_name,
+        "expire_date": db_expire_date,
+        "max_devices": max_devices,
+        "used_devices": len(device_ids),
+        "device_id": device_id,
     })
 
 
