@@ -770,7 +770,7 @@ ADMIN_TEMPLATE = """
 <div class="wrap">
     <div class="header">
         <h1>لوحة إدارة التراخيص</h1>
-        <p>واجهة خفيفة ومرنة ومتوافقة مع الجوال. مدة التجربة الحالية: {{ trial_days }} أيام.</p>
+        <p>بسم الله الرحمن الرحيم: {{ trial_days }} أيام.</p>
     </div>
 
     {% if message %}
