@@ -12,6 +12,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+# مهم جدًا: إجبار SQLAlchemy على استخدام psycopg3 بدل psycopg2
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
@@ -22,6 +26,10 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "12345678")
 
 
+# =========================
+# Models
+# =========================
+
 class License(db.Model):
     __tablename__ = "licenses"
 
@@ -31,7 +39,7 @@ class License(db.Model):
     expire_date = db.Column(db.Date, nullable=False)
     max_devices = db.Column(db.Integer, nullable=False, default=1)
     used_devices = db.Column(db.Integer, nullable=False, default=0)
-    status = db.Column(db.String(32), nullable=False, default="active")
+    status = db.Column(db.String(32), nullable=False, default="active")  # active, blocked
     device_ids = db.Column(db.Text, nullable=False, default="[]")
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -67,6 +75,10 @@ class Trial(db.Model):
     status = db.Column(db.String(32), nullable=False, default="trial")
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
+
+# =========================
+# Helpers
+# =========================
 
 def today_utc():
     return datetime.utcnow().date()
@@ -121,9 +133,17 @@ def serialize_trial(trial: Trial):
     }
 
 
+# =========================
+# Init DB
+# =========================
+
 with app.app_context():
     db.create_all()
 
+
+# =========================
+# API
+# =========================
 
 @app.route("/")
 def home():
@@ -374,6 +394,10 @@ def api_check_trial():
         "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
+
+# =========================
+# Admin HTML
+# =========================
 
 ADMIN_TEMPLATE = """
 <!doctype html>
