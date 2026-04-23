@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, Response
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import or_
 from datetime import datetime, timedelta
 from functools import wraps
 import os
@@ -23,10 +22,6 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "12345678")
 
 
-# =========================
-# Models
-# =========================
-
 class License(db.Model):
     __tablename__ = "licenses"
 
@@ -36,7 +31,7 @@ class License(db.Model):
     expire_date = db.Column(db.Date, nullable=False)
     max_devices = db.Column(db.Integer, nullable=False, default=1)
     used_devices = db.Column(db.Integer, nullable=False, default=0)
-    status = db.Column(db.String(32), nullable=False, default="active")  # active, blocked
+    status = db.Column(db.String(32), nullable=False, default="active")
     device_ids = db.Column(db.Text, nullable=False, default="[]")
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -73,27 +68,12 @@ class Trial(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
-# =========================
-# Helpers
-# =========================
-
 def today_utc():
     return datetime.utcnow().date()
 
 
 def generate_key():
     return str(uuid.uuid4()).replace("-", "").upper()[:16]
-
-
-def parse_date_string(value):
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def json_error(message, status="error", code=400):
-    return jsonify({"status": status, "message": message}), code
 
 
 def check_auth(username, password):
@@ -141,17 +121,9 @@ def serialize_trial(trial: Trial):
     }
 
 
-# =========================
-# Init DB
-# =========================
-
 with app.app_context():
     db.create_all()
 
-
-# =========================
-# API
-# =========================
 
 @app.route("/")
 def home():
@@ -165,6 +137,7 @@ def debug_db():
         "database_url_exists": bool(DATABASE_URL),
         "trial_days": TRIAL_DAYS,
         "admin_username": ADMIN_USERNAME,
+        "driver": "psycopg3",
     })
 
 
@@ -179,12 +152,12 @@ def api_create_license():
         days = int(data.get("days", 30))
         max_devices = int(data.get("max_devices", 1))
     except Exception:
-        return json_error("days / max_devices must be integers")
+        return jsonify({"status": "error", "message": "days / max_devices must be integers"}), 400
 
     if days <= 0:
-        return json_error("days must be greater than zero")
+        return jsonify({"status": "error", "message": "days must be greater than zero"}), 400
     if max_devices <= 0:
-        return json_error("max_devices must be greater than zero")
+        return jsonify({"status": "error", "message": "max_devices must be greater than zero"}), 400
 
     device_id = str(data.get("device_id", "")).strip()
     raw_device_ids = data.get("device_ids", [])
@@ -206,7 +179,7 @@ def api_create_license():
         clean_devices.append(text)
 
     if len(clean_devices) > max_devices:
-        return json_error("initial devices exceed max_devices")
+        return jsonify({"status": "error", "message": "initial devices exceed max_devices"}), 400
 
     lic = License(
         license_key=generate_key(),
@@ -240,9 +213,9 @@ def api_check_license():
     device_id = str(data.get("device_id", "")).strip()
 
     if not license_key:
-        return json_error("license_key required")
+        return jsonify({"status": "error", "message": "license_key required"}), 400
     if not device_id:
-        return json_error("device_id required")
+        return jsonify({"status": "error", "message": "device_id required"}), 400
 
     lic = License.query.filter_by(license_key=license_key).first()
     if not lic:
@@ -252,7 +225,11 @@ def api_check_license():
         return jsonify({"status": "blocked", "message": "License inactive"}), 403
 
     if today_utc() > lic.expire_date:
-        return jsonify({"status": "expired", "message": "License expired", "expire_date": str(lic.expire_date)}), 403
+        return jsonify({
+            "status": "expired",
+            "message": "License expired",
+            "expire_date": str(lic.expire_date),
+        }), 403
 
     devices = lic.device_list()
 
@@ -296,7 +273,7 @@ def api_check_device():
     device_id = str(data.get("device_id", "")).strip()
 
     if not device_id:
-        return json_error("device_id required")
+        return jsonify({"status": "error", "message": "device_id required"}), 400
 
     active_licenses = License.query.filter(
         License.status == "active",
@@ -304,8 +281,7 @@ def api_check_device():
     ).all()
 
     for lic in active_licenses:
-        devices = lic.device_list()
-        if device_id in devices:
+        if device_id in lic.device_list():
             return jsonify({
                 "status": "active",
                 "message": "Device is activated",
@@ -328,7 +304,7 @@ def api_start_trial():
     device_id = str(data.get("device_id", "")).strip()
 
     if not device_id:
-        return json_error("device_id required")
+        return jsonify({"status": "error", "message": "device_id required"}), 400
 
     trial = Trial.query.filter_by(device_id=device_id).first()
 
@@ -369,7 +345,7 @@ def api_check_trial():
     device_id = str(data.get("device_id", "")).strip()
 
     if not device_id:
-        return json_error("device_id required")
+        return jsonify({"status": "error", "message": "device_id required"}), 400
 
     trial = Trial.query.filter_by(device_id=device_id).first()
     if not trial:
@@ -398,10 +374,6 @@ def api_check_trial():
         "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
-
-# =========================
-# Admin HTML
-# =========================
 
 ADMIN_TEMPLATE = """
 <!doctype html>
@@ -679,7 +651,7 @@ def admin_delete_license():
     db.session.delete(lic)
     db.session.commit()
     return redirect(url_for("admin_licenses", message="تم حذف الترخيص"))
-    
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
