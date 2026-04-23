@@ -15,7 +15,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# استخدام psycopg3 بدل psycopg2
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -24,14 +23,10 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
-TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "12345678")
 
-
-# =========================
-# Models
-# =========================
 
 class License(db.Model):
     __tablename__ = "licenses"
@@ -79,10 +74,6 @@ class Trial(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
-# =========================
-# Helpers
-# =========================
-
 def today_utc():
     return datetime.utcnow().date()
 
@@ -116,26 +107,20 @@ def require_auth(func):
 def safe_datetime_text(value):
     if value is None:
         return "-"
-
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d %H:%M:%S")
-
     if isinstance(value, date):
         return value.strftime("%Y-%m-%d")
-
     return str(value)
 
 
 def safe_date_text(value):
     if value is None:
         return "-"
-
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d")
-
     if isinstance(value, date):
         return value.strftime("%Y-%m-%d")
-
     return str(value)
 
 
@@ -164,7 +149,6 @@ def serialize_trial(trial: Trial):
 
 def migrate_legacy_tables():
     with db.engine.begin() as conn:
-        # licenses
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS licenses (
                 id SERIAL PRIMARY KEY,
@@ -209,7 +193,6 @@ def migrate_legacy_tables():
         conn.execute(text("UPDATE licenses SET device_ids = '[]' WHERE device_ids IS NULL"))
         conn.execute(text("UPDATE licenses SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
 
-        # trials
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trials (
                 id SERIAL PRIMARY KEY,
@@ -247,10 +230,6 @@ with app.app_context():
     db.create_all()
     migrate_legacy_tables()
 
-
-# =========================
-# Pages / Diagnostics
-# =========================
 
 @app.route("/")
 def home():
@@ -295,10 +274,6 @@ def admin_health():
             "trace": traceback.format_exc(),
         }), 500
 
-
-# =========================
-# API
-# =========================
 
 @app.route("/api/create-license", methods=["POST"])
 @require_auth
@@ -571,10 +546,6 @@ def api_check_trial():
         }), 500
 
 
-# =========================
-# Admin HTML
-# =========================
-
 ADMIN_TEMPLATE = """
 <!doctype html>
 <html lang="ar" dir="rtl">
@@ -583,30 +554,224 @@ ADMIN_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>لوحة إدارة التراخيص</title>
     <style>
-        body { font-family: Tahoma, Arial, sans-serif; background:#f6f3eb; margin:0; padding:20px; color:#222; }
-        .wrap { max-width:1200px; margin:auto; }
-        .card { background:#fff; border:1px solid #ddd; border-radius:14px; padding:18px; margin-bottom:18px; box-shadow:0 4px 14px rgba(0,0,0,.05); }
-        h1,h2 { margin-top:0; }
-        .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
-        input, button { width:100%; padding:10px 12px; border-radius:10px; border:1px solid #ccc; font-family:inherit; font-size:14px; }
-        button { background:#0f766e; color:#fff; border:none; cursor:pointer; font-weight:bold; }
-        .danger { background:#b91c1c; }
-        .warn { background:#b45309; }
-        .muted { color:#666; }
-        .flash { background:#ecfdf5; border:1px solid #bbf7d0; color:#166534; padding:10px 12px; border-radius:10px; margin-bottom:12px; }
-        table { width:100%; border-collapse:collapse; }
-        th, td { padding:10px; border-bottom:1px solid #eee; text-align:right; vertical-align:top; }
-        th { background:#f0ebe0; }
-        .tag { display:inline-block; padding:4px 10px; border-radius:999px; background:#e8f7ee; color:#166534; font-size:12px; margin:2px 0; }
-        .trial { background:#e8f0ff; color:#1d4ed8; }
-        .blocked { background:#fff3cd; color:#8a6d3b; }
-        .device-box { margin-bottom:8px; }
-        form.inline { display:inline-block; margin:4px 0; }
+        :root{
+            --bg:#f7f4ee;
+            --panel:#fffdf9;
+            --line:#e7dfd2;
+            --text:#1f2937;
+            --muted:#6b7280;
+            --accent:#0f766e;
+            --accent-dark:#0b5f58;
+            --danger:#b91c1c;
+            --warn:#c07a12;
+            --shadow:0 8px 24px rgba(15,23,42,.06);
+            --radius:16px;
+        }
+        *{box-sizing:border-box}
+        body{
+            font-family:Tahoma, Arial, sans-serif;
+            background:linear-gradient(180deg,#fbf8f3 0%, #f4efe5 100%);
+            margin:0;
+            padding:14px;
+            color:var(--text);
+        }
+        .wrap{
+            max-width:1180px;
+            margin:auto;
+        }
+        .header{
+            margin-bottom:14px;
+        }
+        .header h1{
+            margin:0 0 6px;
+            font-size:24px;
+            font-weight:700;
+        }
+        .header p{
+            margin:0;
+            color:var(--muted);
+            font-size:14px;
+        }
+        .card{
+            background:var(--panel);
+            border:1px solid var(--line);
+            border-radius:var(--radius);
+            padding:14px;
+            margin-bottom:14px;
+            box-shadow:var(--shadow);
+        }
+        h2{
+            margin:0 0 12px;
+            font-size:18px;
+            font-weight:700;
+        }
+        .grid{
+            display:grid;
+            grid-template-columns:repeat(4, minmax(0,1fr));
+            gap:10px;
+        }
+        input, button{
+            width:100%;
+            min-height:42px;
+            padding:10px 12px;
+            border-radius:12px;
+            border:1px solid #d8cfc2;
+            font-family:inherit;
+            font-size:14px;
+        }
+        input{
+            background:#fff;
+            color:var(--text);
+        }
+        input:focus{
+            outline:none;
+            border-color:#7cb8b1;
+            box-shadow:0 0 0 3px rgba(15,118,110,.10);
+        }
+        button{
+            background:var(--accent);
+            color:#fff;
+            border:none;
+            cursor:pointer;
+            font-weight:700;
+            transition:.15s ease;
+        }
+        button:hover{
+            background:var(--accent-dark);
+        }
+        .danger{background:var(--danger)}
+        .danger:hover{background:#991b1b}
+        .warn{background:var(--warn)}
+        .warn:hover{background:#a16207}
+        .muted{
+            color:var(--muted);
+            font-size:13px;
+        }
+        .flash{
+            background:#ecfdf5;
+            border:1px solid #bbf7d0;
+            color:#166534;
+            padding:10px 12px;
+            border-radius:12px;
+            margin-bottom:12px;
+            font-size:14px;
+        }
+        .table-wrap{
+            overflow-x:auto;
+            -webkit-overflow-scrolling:touch;
+            border-radius:12px;
+        }
+        table{
+            width:100%;
+            border-collapse:collapse;
+            min-width:860px;
+        }
+        th, td{
+            padding:10px 8px;
+            border-bottom:1px solid #efe8db;
+            text-align:right;
+            vertical-align:top;
+            font-size:13px;
+        }
+        th{
+            background:#f6f1e7;
+            color:#374151;
+            font-weight:700;
+            position:sticky;
+            top:0;
+        }
+        .tag{
+            display:inline-block;
+            padding:4px 9px;
+            border-radius:999px;
+            background:#e7f8f4;
+            color:#0f766e;
+            font-size:12px;
+            margin:2px 0;
+            line-height:1.6;
+            word-break:break-all;
+        }
+        .trial{
+            background:#e8f0ff;
+            color:#1d4ed8;
+        }
+        .blocked{
+            background:#fff3cd;
+            color:#8a6d3b;
+        }
+        .device-box{
+            margin-bottom:6px;
+        }
+        form.inline{
+            display:inline-block;
+            margin:4px 0 0;
+        }
+        .actions{
+            display:flex;
+            flex-wrap:wrap;
+            gap:6px;
+            min-width:250px;
+        }
+        .actions form.inline{
+            margin:0;
+        }
+        .actions button,
+        .actions input{
+            width:auto;
+        }
+
+        @media (max-width: 900px){
+            .grid{
+                grid-template-columns:repeat(2, minmax(0,1fr));
+            }
+            .header h1{
+                font-size:21px;
+            }
+        }
+
+        @media (max-width: 640px){
+            body{
+                padding:10px;
+            }
+            .card{
+                padding:12px;
+                border-radius:14px;
+            }
+            .grid{
+                grid-template-columns:1fr;
+            }
+            .header h1{
+                font-size:19px;
+            }
+            .header p{
+                font-size:13px;
+            }
+            h2{
+                font-size:16px;
+            }
+            input, button{
+                min-height:44px;
+                font-size:14px;
+            }
+            table{
+                min-width:720px;
+            }
+            th, td{
+                font-size:12px;
+                padding:9px 7px;
+            }
+            .tag{
+                font-size:11px;
+            }
+        }
     </style>
 </head>
 <body>
 <div class="wrap">
-    <h1>لوحة إدارة التراخيص</h1>
+    <div class="header">
+        <h1>لوحة إدارة التراخيص</h1>
+        <p>واجهة خفيفة ومرنة ومتوافقة مع الجوال. مدة التجربة الحالية: {{ trial_days }} أيام.</p>
+    </div>
 
     {% if message %}
         <div class="flash">{{ message }}</div>
@@ -627,71 +792,75 @@ ADMIN_TEMPLATE = """
     <div class="card">
         <h2>التراخيص</h2>
         {% if licenses %}
-        <table>
-            <tr>
-                <th>الكود</th>
-                <th>العميل</th>
-                <th>الانتهاء</th>
-                <th>الحالة</th>
-                <th>الأجهزة</th>
-                <th>الاستخدام</th>
-                <th>إدارة</th>
-            </tr>
-            {% for l in licenses %}
-            <tr>
-                <td><strong>{{ l.license_key }}</strong></td>
-                <td>{{ l.customer_name or '-' }}</td>
-                <td>{{ l.expire_date }}</td>
-                <td>
-                    {% if l.status == 'active' %}
-                        <span class="tag">{{ l.status }}</span>
-                    {% else %}
-                        <span class="tag blocked">{{ l.status }}</span>
-                    {% endif %}
-                </td>
-                <td>
-                    {% if l.device_ids %}
-                        {% for d in l.device_ids %}
-                            <div class="device-box">
-                                <span class="tag">{{ d }}</span>
-                                <form method="post" action="{{ url_for('admin_remove_device') }}" class="inline">
-                                    <input type="hidden" name="license_key" value="{{ l.license_key }}">
-                                    <input type="hidden" name="device_id" value="{{ d }}">
-                                    <button class="danger" type="submit">حذف الجهاز</button>
-                                </form>
-                            </div>
-                        {% endfor %}
-                    {% else %}
-                        <span class="muted">لا توجد أجهزة</span>
-                    {% endif %}
-                </td>
-                <td>{{ l.used_devices }} / {{ l.max_devices }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('admin_reset_devices') }}" class="inline">
-                        <input type="hidden" name="license_key" value="{{ l.license_key }}">
-                        <button class="warn" type="submit">تصفير الأجهزة</button>
-                    </form>
+        <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>الكود</th>
+                    <th>العميل</th>
+                    <th>الانتهاء</th>
+                    <th>الحالة</th>
+                    <th>الأجهزة</th>
+                    <th>الاستخدام</th>
+                    <th>إدارة</th>
+                </tr>
+                {% for l in licenses %}
+                <tr>
+                    <td><strong>{{ l.license_key }}</strong></td>
+                    <td>{{ l.customer_name or '-' }}</td>
+                    <td>{{ l.expire_date }}</td>
+                    <td>
+                        {% if l.status == 'active' %}
+                            <span class="tag">{{ l.status }}</span>
+                        {% else %}
+                            <span class="tag blocked">{{ l.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if l.device_ids %}
+                            {% for d in l.device_ids %}
+                                <div class="device-box">
+                                    <span class="tag">{{ d }}</span>
+                                    <form method="post" action="{{ url_for('admin_remove_device') }}" class="inline">
+                                        <input type="hidden" name="license_key" value="{{ l.license_key }}">
+                                        <input type="hidden" name="device_id" value="{{ d }}">
+                                        <button class="danger" type="submit">حذف الجهاز</button>
+                                    </form>
+                                </div>
+                            {% endfor %}
+                        {% else %}
+                            <span class="muted">لا توجد أجهزة</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ l.used_devices }} / {{ l.max_devices }}</td>
+                    <td>
+                        <div class="actions">
+                            <form method="post" action="{{ url_for('admin_reset_devices') }}" class="inline">
+                                <input type="hidden" name="license_key" value="{{ l.license_key }}">
+                                <button class="warn" type="submit">تصفير الأجهزة</button>
+                            </form>
 
-                    <form method="post" action="{{ url_for('admin_toggle_license') }}" class="inline">
-                        <input type="hidden" name="license_key" value="{{ l.license_key }}">
-                        <input type="hidden" name="new_status" value="{{ 'blocked' if l.status == 'active' else 'active' }}">
-                        <button type="submit">{{ 'إيقاف' if l.status == 'active' else 'تفعيل' }}</button>
-                    </form>
+                            <form method="post" action="{{ url_for('admin_toggle_license') }}" class="inline">
+                                <input type="hidden" name="license_key" value="{{ l.license_key }}">
+                                <input type="hidden" name="new_status" value="{{ 'blocked' if l.status == 'active' else 'active' }}">
+                                <button type="submit">{{ 'إيقاف' if l.status == 'active' else 'تفعيل' }}</button>
+                            </form>
 
-                    <form method="post" action="{{ url_for('admin_update_max_devices') }}" class="inline">
-                        <input type="hidden" name="license_key" value="{{ l.license_key }}">
-                        <input type="number" name="max_devices" min="1" value="{{ l.max_devices }}" style="width:90px;">
-                        <button type="submit">تحديث الأجهزة</button>
-                    </form>
+                            <form method="post" action="{{ url_for('admin_update_max_devices') }}" class="inline">
+                                <input type="hidden" name="license_key" value="{{ l.license_key }}">
+                                <input type="number" name="max_devices" min="1" value="{{ l.max_devices }}" style="width:78px;">
+                                <button type="submit">تحديث</button>
+                            </form>
 
-                    <form method="post" action="{{ url_for('admin_delete_license') }}" class="inline" onsubmit="return confirm('هل تريد حذف الترخيص؟');">
-                        <input type="hidden" name="license_key" value="{{ l.license_key }}">
-                        <button class="danger" type="submit">حذف الترخيص</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
+                            <form method="post" action="{{ url_for('admin_delete_license') }}" class="inline" onsubmit="return confirm('هل تريد حذف الترخيص؟');">
+                                <input type="hidden" name="license_key" value="{{ l.license_key }}">
+                                <button class="danger" type="submit">حذف</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
         {% else %}
             <p class="muted">لا توجد تراخيص بعد.</p>
         {% endif %}
@@ -700,24 +869,26 @@ ADMIN_TEMPLATE = """
     <div class="card">
         <h2>الأجهزة التجريبية</h2>
         {% if trials %}
-        <table>
-            <tr>
-                <th>معرف الجهاز</th>
-                <th>بداية التجربة</th>
-                <th>نهاية التجربة</th>
-                <th>الحالة</th>
-                <th>الإنشاء</th>
-            </tr>
-            {% for t in trials %}
-            <tr>
-                <td>{{ t.device_id }}</td>
-                <td>{{ t.start_date }}</td>
-                <td>{{ t.expire_date }}</td>
-                <td><span class="tag trial">{{ t.status }}</span></td>
-                <td>{{ t.created_at }}</td>
-            </tr>
-            {% endfor %}
-        </table>
+        <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>معرف الجهاز</th>
+                    <th>بداية التجربة</th>
+                    <th>نهاية التجربة</th>
+                    <th>الحالة</th>
+                    <th>الإنشاء</th>
+                </tr>
+                {% for t in trials %}
+                <tr>
+                    <td>{{ t.device_id }}</td>
+                    <td>{{ t.start_date }}</td>
+                    <td>{{ t.expire_date }}</td>
+                    <td><span class="tag trial">{{ t.status }}</span></td>
+                    <td>{{ t.created_at }}</td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
         {% else %}
             <p class="muted">لا توجد أجهزة Trial بعد.</p>
         {% endif %}
@@ -735,7 +906,13 @@ def admin_licenses():
         message = request.args.get("message", "")
         licenses = [serialize_license(x) for x in License.query.order_by(License.id.desc()).all()]
         trials = [serialize_trial(x) for x in Trial.query.order_by(Trial.id.desc()).all()]
-        return render_template_string(ADMIN_TEMPLATE, licenses=licenses, trials=trials, message=message)
+        return render_template_string(
+            ADMIN_TEMPLATE,
+            licenses=licenses,
+            trials=trials,
+            message=message,
+            trial_days=TRIAL_DAYS,
+        )
     except Exception as exc:
         return jsonify({
             "status": "error",
