@@ -6,13 +6,16 @@ from functools import wraps
 import os
 import json
 import uuid
+import traceback
 
 app = Flask(__name__)
+app.config["PROPAGATE_EXCEPTIONS"] = True
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
+# مهم: إجبار SQLAlchemy على استخدام psycopg3
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -26,16 +29,20 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "12345678")
 
 
+# =========================
+# Models
+# =========================
+
 class License(db.Model):
     __tablename__ = "licenses"
 
     id = db.Column(db.Integer, primary_key=True)
     license_key = db.Column(db.String(64), unique=True, nullable=False, index=True)
     customer_name = db.Column(db.String(120), nullable=True)
-    expire_date = db.Column(db.Date, nullable=False)
+    expire_date = db.Column(db.Date, nullable=True)
     max_devices = db.Column(db.Integer, nullable=False, default=1)
     used_devices = db.Column(db.Integer, nullable=False, default=0)
-    status = db.Column(db.String(32), nullable=False, default="active")
+    status = db.Column(db.String(32), nullable=False, default="active")  # active, blocked
     device_ids = db.Column(db.Text, nullable=False, default="[]")
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -66,11 +73,15 @@ class Trial(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.String(128), unique=True, nullable=False, index=True)
-    start_date = db.Column(db.Date, nullable=False)
-    expire_date = db.Column(db.Date, nullable=False)
-    status = db.Column(db.String(32), nullable=False, default="trial")
+    start_date = db.Column(db.Date, nullable=True)
+    expire_date = db.Column(db.Date, nullable=True)
+    status = db.Column(db.String(32), nullable=False, default="trial")  # trial, expired
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
+
+# =========================
+# Helpers
+# =========================
 
 def today_utc():
     return datetime.utcnow().date()
@@ -106,9 +117,9 @@ def serialize_license(lic: License):
     return {
         "license_key": lic.license_key,
         "customer_name": lic.customer_name or "",
-        "expire_date": str(lic.expire_date),
-        "max_devices": lic.max_devices or 1,
-        "used_devices": lic.used_devices or 0,
+        "expire_date": str(lic.expire_date) if lic.expire_date else "-",
+        "max_devices": int(lic.max_devices or 1),
+        "used_devices": int(lic.used_devices or 0),
         "status": lic.status or "active",
         "device_ids": lic.device_list(),
         "created_at": lic.created_at.strftime("%Y-%m-%d %H:%M:%S") if lic.created_at else "-",
@@ -118,16 +129,20 @@ def serialize_license(lic: License):
 def serialize_trial(trial: Trial):
     return {
         "device_id": trial.device_id,
-        "start_date": str(trial.start_date),
-        "expire_date": str(trial.expire_date),
+        "start_date": str(trial.start_date) if trial.start_date else "-",
+        "expire_date": str(trial.expire_date) if trial.expire_date else "-",
         "status": trial.status or "trial",
         "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
     }
 
 
 def migrate_legacy_tables():
+    """
+    يجهز الجداول القديمة لو كانت ناقصة أعمدة.
+    هذا مهم لأنك جرّبت أكثر من نسخة من السيرفر سابقًا.
+    """
     with db.engine.begin() as conn:
-        # licenses
+        # licenses table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS licenses (
                 id SERIAL PRIMARY KEY,
@@ -142,25 +157,28 @@ def migrate_legacy_tables():
             )
         """))
 
-        columns = {row[0] for row in conn.execute(text("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name='licenses'
-        """)).fetchall()}
+        license_columns = {
+            row[0]
+            for row in conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'licenses'
+            """)).fetchall()
+        }
 
-        if "customer_name" not in columns:
+        if "customer_name" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN customer_name VARCHAR(120)"))
-        if "expire_date" not in columns:
+        if "expire_date" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN expire_date DATE"))
-        if "max_devices" not in columns:
+        if "max_devices" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN max_devices INTEGER DEFAULT 1"))
-        if "used_devices" not in columns:
+        if "used_devices" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN used_devices INTEGER DEFAULT 0"))
-        if "status" not in columns:
+        if "status" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN status VARCHAR(32) DEFAULT 'active'"))
-        if "device_ids" not in columns:
+        if "device_ids" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN device_ids TEXT DEFAULT '[]'"))
-        if "created_at" not in columns:
+        if "created_at" not in license_columns:
             conn.execute(text("ALTER TABLE licenses ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
 
         conn.execute(text("UPDATE licenses SET max_devices = 1 WHERE max_devices IS NULL"))
@@ -168,8 +186,9 @@ def migrate_legacy_tables():
         conn.execute(text("UPDATE licenses SET status = 'active' WHERE status IS NULL"))
         conn.execute(text("UPDATE licenses SET device_ids = '[]' WHERE device_ids IS NULL"))
         conn.execute(text("UPDATE licenses SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses (license_key)"))
 
-        # trials
+        # trials table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trials (
                 id SERIAL PRIMARY KEY,
@@ -181,29 +200,37 @@ def migrate_legacy_tables():
             )
         """))
 
-        t_columns = {row[0] for row in conn.execute(text("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name='trials'
-        """)).fetchall()}
+        trial_columns = {
+            row[0]
+            for row in conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'trials'
+            """)).fetchall()
+        }
 
-        if "start_date" not in t_columns:
+        if "start_date" not in trial_columns:
             conn.execute(text("ALTER TABLE trials ADD COLUMN start_date DATE"))
-        if "expire_date" not in t_columns:
+        if "expire_date" not in trial_columns:
             conn.execute(text("ALTER TABLE trials ADD COLUMN expire_date DATE"))
-        if "status" not in t_columns:
+        if "status" not in trial_columns:
             conn.execute(text("ALTER TABLE trials ADD COLUMN status VARCHAR(32) DEFAULT 'trial'"))
-        if "created_at" not in t_columns:
+        if "created_at" not in trial_columns:
             conn.execute(text("ALTER TABLE trials ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
 
         conn.execute(text("UPDATE trials SET status = 'trial' WHERE status IS NULL"))
         conn.execute(text("UPDATE trials SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trials_device_id ON trials (device_id)"))
 
 
 with app.app_context():
     db.create_all()
     migrate_legacy_tables()
 
+
+# =========================
+# Pages / Diagnostics
+# =========================
 
 @app.route("/")
 def home():
@@ -221,205 +248,312 @@ def debug_db():
     })
 
 
+@app.route("/admin/health")
+@require_auth
+def admin_health():
+    try:
+        licenses_count = License.query.count()
+        trials_count = Trial.query.count()
+
+        sample_license = License.query.order_by(License.id.desc()).first()
+        sample_trial = Trial.query.order_by(Trial.id.desc()).first()
+
+        return jsonify({
+            "status": "ok",
+            "database_url_exists": bool(DATABASE_URL),
+            "driver": "psycopg3",
+            "trial_days": TRIAL_DAYS,
+            "licenses_count": licenses_count,
+            "trials_count": trials_count,
+            "sample_license": serialize_license(sample_license) if sample_license else None,
+            "sample_trial": serialize_trial(sample_trial) if sample_trial else None,
+        })
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
+
+
+# =========================
+# API
+# =========================
+
 @app.route("/api/create-license", methods=["POST"])
 @require_auth
 def api_create_license():
-    data = request.get_json(silent=True) or {}
-
-    customer_name = str(data.get("customer_name", "Unknown")).strip() or "Unknown"
     try:
-        days = int(data.get("days", 30))
-        max_devices = int(data.get("max_devices", 1))
-    except Exception:
-        return jsonify({"status": "error", "message": "days / max_devices must be integers"}), 400
+        data = request.get_json(silent=True) or {}
 
-    if days <= 0 or max_devices <= 0:
-        return jsonify({"status": "error", "message": "days/max_devices must be greater than zero"}), 400
+        customer_name = str(data.get("customer_name", "Unknown")).strip() or "Unknown"
 
-    device_id = str(data.get("device_id", "")).strip()
-    initial_devices = [device_id] if device_id else []
+        try:
+            days = int(data.get("days", 30))
+            max_devices = int(data.get("max_devices", 1))
+        except Exception:
+            return jsonify({"status": "error", "message": "days / max_devices must be integers"}), 400
 
-    lic = License(
-        license_key=generate_key(),
-        customer_name=customer_name,
-        expire_date=today_utc() + timedelta(days=days),
-        max_devices=max_devices,
-        status="active",
-    )
-    lic.set_device_list(initial_devices)
+        if days <= 0:
+            return jsonify({"status": "error", "message": "days must be greater than zero"}), 400
+        if max_devices <= 0:
+            return jsonify({"status": "error", "message": "max_devices must be greater than zero"}), 400
 
-    db.session.add(lic)
-    db.session.commit()
+        device_id = str(data.get("device_id", "")).strip()
+        raw_device_ids = data.get("device_ids", [])
 
-    return jsonify({
-        "status": "success",
-        "license_key": lic.license_key,
-        "customer_name": lic.customer_name,
-        "expire_date": str(lic.expire_date),
-        "max_devices": lic.max_devices,
-        "used_devices": lic.used_devices,
-        "device_ids": lic.device_list(),
-        "created_at": lic.created_at.strftime("%Y-%m-%d %H:%M:%S") if lic.created_at else "-",
-    })
+        initial_devices = []
+        if device_id:
+            initial_devices.append(device_id)
+
+        if isinstance(raw_device_ids, list):
+            initial_devices.extend(raw_device_ids)
+
+        clean_devices = []
+        seen = set()
+        for item in initial_devices:
+            text_value = str(item or "").strip()
+            if not text_value or text_value in seen:
+                continue
+            seen.add(text_value)
+            clean_devices.append(text_value)
+
+        if len(clean_devices) > max_devices:
+            return jsonify({"status": "error", "message": "initial devices exceed max_devices"}), 400
+
+        lic = License(
+            license_key=generate_key(),
+            customer_name=customer_name,
+            expire_date=today_utc() + timedelta(days=days),
+            max_devices=max_devices,
+            status="active",
+        )
+        lic.set_device_list(clean_devices)
+
+        db.session.add(lic)
+        db.session.commit()
+
+        return jsonify({
+            "status": "success",
+            "license_key": lic.license_key,
+            "customer_name": lic.customer_name,
+            "expire_date": str(lic.expire_date),
+            "max_devices": lic.max_devices,
+            "used_devices": lic.used_devices,
+            "device_ids": lic.device_list(),
+            "created_at": lic.created_at.strftime("%Y-%m-%d %H:%M:%S") if lic.created_at else "-",
+        })
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/api/check-license", methods=["POST"])
 def api_check_license():
-    data = request.get_json(silent=True) or {}
+    try:
+        data = request.get_json(silent=True) or {}
 
-    license_key = str(data.get("license_key", "")).strip()
-    device_id = str(data.get("device_id", "")).strip()
+        license_key = str(data.get("license_key", "")).strip()
+        device_id = str(data.get("device_id", "")).strip()
 
-    if not license_key or not device_id:
-        return jsonify({"status": "error", "message": "license_key and device_id required"}), 400
+        if not license_key or not device_id:
+            return jsonify({"status": "error", "message": "license_key and device_id required"}), 400
 
-    lic = License.query.filter_by(license_key=license_key).first()
-    if not lic:
-        return jsonify({"status": "invalid", "message": "License not found"}), 404
+        lic = License.query.filter_by(license_key=license_key).first()
+        if not lic:
+            return jsonify({"status": "invalid", "message": "License not found"}), 404
 
-    if (lic.status or "active") != "active":
-        return jsonify({"status": "blocked", "message": "License inactive"}), 403
+        if (lic.status or "active") != "active":
+            return jsonify({"status": "blocked", "message": "License inactive"}), 403
 
-    if lic.expire_date and today_utc() > lic.expire_date:
-        return jsonify({"status": "expired", "message": "License expired", "expire_date": str(lic.expire_date)}), 403
+        if lic.expire_date and today_utc() > lic.expire_date:
+            return jsonify({
+                "status": "expired",
+                "message": "License expired",
+                "expire_date": str(lic.expire_date),
+            }), 403
 
-    devices = lic.device_list()
+        devices = lic.device_list()
 
-    if device_id in devices:
+        if device_id in devices:
+            return jsonify({
+                "status": "active",
+                "message": "Valid",
+                "customer_name": lic.customer_name,
+                "expire_date": str(lic.expire_date),
+                "max_devices": lic.max_devices,
+                "used_devices": len(devices),
+            })
+
+        if len(devices) >= int(lic.max_devices or 1):
+            return jsonify({
+                "status": "denied",
+                "message": "Device limit reached",
+                "customer_name": lic.customer_name,
+                "expire_date": str(lic.expire_date),
+                "max_devices": lic.max_devices,
+                "used_devices": len(devices),
+            }), 403
+
+        devices.append(device_id)
+        lic.set_device_list(devices)
+        db.session.commit()
+
         return jsonify({
             "status": "active",
-            "message": "Valid",
+            "message": "Activated",
             "customer_name": lic.customer_name,
             "expire_date": str(lic.expire_date),
             "max_devices": lic.max_devices,
-            "used_devices": len(devices),
+            "used_devices": lic.used_devices,
         })
-
-    if len(devices) >= (lic.max_devices or 1):
+    except Exception as exc:
+        db.session.rollback()
         return jsonify({
-            "status": "denied",
-            "message": "Device limit reached",
-            "customer_name": lic.customer_name,
-            "expire_date": str(lic.expire_date),
-            "max_devices": lic.max_devices,
-            "used_devices": len(devices),
-        }), 403
-
-    devices.append(device_id)
-    lic.set_device_list(devices)
-    db.session.commit()
-
-    return jsonify({
-        "status": "active",
-        "message": "Activated",
-        "customer_name": lic.customer_name,
-        "expire_date": str(lic.expire_date),
-        "max_devices": lic.max_devices,
-        "used_devices": lic.used_devices,
-    })
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/api/check-device", methods=["POST"])
 def api_check_device():
-    data = request.get_json(silent=True) or {}
-    device_id = str(data.get("device_id", "")).strip()
+    try:
+        data = request.get_json(silent=True) or {}
+        device_id = str(data.get("device_id", "")).strip()
 
-    if not device_id:
-        return jsonify({"status": "error", "message": "device_id required"}), 400
+        if not device_id:
+            return jsonify({"status": "error", "message": "device_id required"}), 400
 
-    active_licenses = License.query.filter(
-        License.status == "active",
-        License.expire_date >= today_utc(),
-    ).all()
+        active_licenses = License.query.filter(
+            License.status == "active",
+            License.expire_date >= today_utc(),
+        ).all()
 
-    for lic in active_licenses:
-        if device_id in lic.device_list():
-            return jsonify({
-                "status": "active",
-                "message": "Device is activated",
-                "customer_name": lic.customer_name,
-                "license_key": lic.license_key,
-                "expire_date": str(lic.expire_date),
-                "max_devices": lic.max_devices,
-                "used_devices": lic.used_devices,
-            })
+        for lic in active_licenses:
+            if device_id in lic.device_list():
+                return jsonify({
+                    "status": "active",
+                    "message": "Device is activated",
+                    "customer_name": lic.customer_name,
+                    "license_key": lic.license_key,
+                    "expire_date": str(lic.expire_date),
+                    "max_devices": lic.max_devices,
+                    "used_devices": lic.used_devices,
+                })
 
-    return jsonify({"status": "inactive", "message": "Device is not activated"}), 404
+        return jsonify({
+            "status": "inactive",
+            "message": "Device is not activated",
+        }), 404
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/api/start-trial", methods=["POST"])
 def api_start_trial():
-    data = request.get_json(silent=True) or {}
-    device_id = str(data.get("device_id", "")).strip()
+    try:
+        data = request.get_json(silent=True) or {}
+        device_id = str(data.get("device_id", "")).strip()
 
-    if not device_id:
-        return jsonify({"status": "error", "message": "device_id required"}), 400
+        if not device_id:
+            return jsonify({"status": "error", "message": "device_id required"}), 400
 
-    trial = Trial.query.filter_by(device_id=device_id).first()
+        trial = Trial.query.filter_by(device_id=device_id).first()
 
-    if not trial:
-        trial = Trial(
-            device_id=device_id,
-            start_date=today_utc(),
-            expire_date=today_utc() + timedelta(days=TRIAL_DAYS),
-            status="trial",
-        )
-        db.session.add(trial)
-        db.session.commit()
+        if not trial:
+            trial = Trial(
+                device_id=device_id,
+                start_date=today_utc(),
+                expire_date=today_utc() + timedelta(days=TRIAL_DAYS),
+                status="trial",
+            )
+            db.session.add(trial)
+            db.session.commit()
 
-    if trial.expire_date and today_utc() > trial.expire_date:
-        trial.status = "expired"
-        db.session.commit()
+        if trial.expire_date and today_utc() > trial.expire_date:
+            trial.status = "expired"
+            db.session.commit()
+            return jsonify({
+                "status": "expired",
+                "message": "Trial expired",
+                "expire_date": str(trial.expire_date),
+                "days_left": 0,
+            }), 403
+
+        days_left = max(0, (trial.expire_date - today_utc()).days)
         return jsonify({
-            "status": "expired",
-            "message": "Trial expired",
+            "status": "trial",
+            "message": "Trial active",
             "expire_date": str(trial.expire_date),
-            "days_left": 0,
-        }), 403
-
-    days_left = max(0, (trial.expire_date - today_utc()).days)
-    return jsonify({
-        "status": "trial",
-        "message": "Trial active",
-        "expire_date": str(trial.expire_date),
-        "days_left": days_left,
-        "trial_days": TRIAL_DAYS,
-        "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
-    })
+            "days_left": days_left,
+            "trial_days": TRIAL_DAYS,
+            "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
+        })
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/api/check-trial", methods=["POST"])
 def api_check_trial():
-    data = request.get_json(silent=True) or {}
-    device_id = str(data.get("device_id", "")).strip()
+    try:
+        data = request.get_json(silent=True) or {}
+        device_id = str(data.get("device_id", "")).strip()
 
-    if not device_id:
-        return jsonify({"status": "error", "message": "device_id required"}), 400
+        if not device_id:
+            return jsonify({"status": "error", "message": "device_id required"}), 400
 
-    trial = Trial.query.filter_by(device_id=device_id).first()
-    if not trial:
-        return jsonify({"status": "inactive", "message": "Trial not found"}), 404
+        trial = Trial.query.filter_by(device_id=device_id).first()
+        if not trial:
+            return jsonify({
+                "status": "inactive",
+                "message": "Trial not found",
+            }), 404
 
-    if trial.expire_date and today_utc() > trial.expire_date:
-        trial.status = "expired"
-        db.session.commit()
+        if trial.expire_date and today_utc() > trial.expire_date:
+            trial.status = "expired"
+            db.session.commit()
+            return jsonify({
+                "status": "expired",
+                "message": "Trial expired",
+                "expire_date": str(trial.expire_date),
+                "days_left": 0,
+            }), 403
+
+        days_left = max(0, (trial.expire_date - today_utc()).days)
         return jsonify({
-            "status": "expired",
-            "message": "Trial expired",
+            "status": "trial",
+            "message": "Trial active",
             "expire_date": str(trial.expire_date),
-            "days_left": 0,
-        }), 403
+            "days_left": days_left,
+            "trial_days": TRIAL_DAYS,
+            "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
+        })
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
-    days_left = max(0, (trial.expire_date - today_utc()).days)
-    return jsonify({
-        "status": "trial",
-        "message": "Trial active",
-        "expire_date": str(trial.expire_date),
-        "days_left": days_left,
-        "trial_days": TRIAL_DAYS,
-        "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
-    })
 
+# =========================
+# Admin HTML
+# =========================
 
 ADMIN_TEMPLATE = """
 <!doctype html>
@@ -577,126 +711,181 @@ ADMIN_TEMPLATE = """
 @app.route("/admin/licenses", methods=["GET"])
 @require_auth
 def admin_licenses():
-    message = request.args.get("message", "")
-    licenses = [serialize_license(x) for x in License.query.order_by(License.id.desc()).all()]
-    trials = [serialize_trial(x) for x in Trial.query.order_by(Trial.id.desc()).all()]
-    return render_template_string(ADMIN_TEMPLATE, licenses=licenses, trials=trials, message=message)
+    try:
+        message = request.args.get("message", "")
+        licenses = [serialize_license(x) for x in License.query.order_by(License.id.desc()).all()]
+        trials = [serialize_trial(x) for x in Trial.query.order_by(Trial.id.desc()).all()]
+        return render_template_string(ADMIN_TEMPLATE, licenses=licenses, trials=trials, message=message)
+    except Exception as exc:
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/admin/create-license", methods=["POST"])
 @require_auth
 def admin_create_license():
-    customer_name = str(request.form.get("customer_name", "Unknown")).strip() or "Unknown"
-
     try:
-        days = int(request.form.get("days", 30))
-        max_devices = int(request.form.get("max_devices", 1))
-    except Exception:
-        return redirect(url_for("admin_licenses", message="days / max_devices غير صحيحة"))
+        customer_name = str(request.form.get("customer_name", "Unknown")).strip() or "Unknown"
 
-    if days <= 0 or max_devices <= 0:
-        return redirect(url_for("admin_licenses", message="عدد الأيام والأجهزة يجب أن يكون أكبر من صفر"))
+        try:
+            days = int(request.form.get("days", 30))
+            max_devices = int(request.form.get("max_devices", 1))
+        except Exception:
+            return redirect(url_for("admin_licenses", message="days / max_devices غير صحيحة"))
 
-    lic = License(
-        license_key=generate_key(),
-        customer_name=customer_name,
-        expire_date=today_utc() + timedelta(days=days),
-        max_devices=max_devices,
-        used_devices=0,
-        status="active",
-        device_ids="[]",
-    )
-    db.session.add(lic)
-    db.session.commit()
+        if days <= 0 or max_devices <= 0:
+            return redirect(url_for("admin_licenses", message="عدد الأيام والأجهزة يجب أن يكون أكبر من صفر"))
 
-    return redirect(url_for("admin_licenses", message=f"تم إنشاء الترخيص: {lic.license_key}"))
+        lic = License(
+            license_key=generate_key(),
+            customer_name=customer_name,
+            expire_date=today_utc() + timedelta(days=days),
+            max_devices=max_devices,
+            used_devices=0,
+            status="active",
+            device_ids="[]",
+        )
+        db.session.add(lic)
+        db.session.commit()
+
+        return redirect(url_for("admin_licenses", message=f"تم إنشاء الترخيص: {lic.license_key}"))
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/admin/remove-device", methods=["POST"])
 @require_auth
 def admin_remove_device():
-    license_key = str(request.form.get("license_key", "")).strip()
-    device_id = str(request.form.get("device_id", "")).strip()
+    try:
+        license_key = str(request.form.get("license_key", "")).strip()
+        device_id = str(request.form.get("device_id", "")).strip()
 
-    lic = License.query.filter_by(license_key=license_key).first()
-    if not lic:
-        return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
+        lic = License.query.filter_by(license_key=license_key).first()
+        if not lic:
+            return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
 
-    devices = lic.device_list()
-    if device_id in devices:
-        devices.remove(device_id)
-        lic.set_device_list(devices)
-        db.session.commit()
+        devices = lic.device_list()
+        if device_id in devices:
+            devices.remove(device_id)
+            lic.set_device_list(devices)
+            db.session.commit()
 
-    return redirect(url_for("admin_licenses", message="تم حذف الجهاز"))
+        return redirect(url_for("admin_licenses", message="تم حذف الجهاز"))
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/admin/reset-devices", methods=["POST"])
 @require_auth
 def admin_reset_devices():
-    license_key = str(request.form.get("license_key", "")).strip()
+    try:
+        license_key = str(request.form.get("license_key", "")).strip()
 
-    lic = License.query.filter_by(license_key=license_key).first()
-    if not lic:
-        return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
+        lic = License.query.filter_by(license_key=license_key).first()
+        if not lic:
+            return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
 
-    lic.set_device_list([])
-    db.session.commit()
-    return redirect(url_for("admin_licenses", message="تم تصفير الأجهزة"))
+        lic.set_device_list([])
+        db.session.commit()
+        return redirect(url_for("admin_licenses", message="تم تصفير الأجهزة"))
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/admin/toggle-license", methods=["POST"])
 @require_auth
 def admin_toggle_license():
-    license_key = str(request.form.get("license_key", "")).strip()
-    new_status = str(request.form.get("new_status", "blocked")).strip()
+    try:
+        license_key = str(request.form.get("license_key", "")).strip()
+        new_status = str(request.form.get("new_status", "blocked")).strip()
 
-    lic = License.query.filter_by(license_key=license_key).first()
-    if not lic:
-        return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
+        lic = License.query.filter_by(license_key=license_key).first()
+        if not lic:
+            return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
 
-    if new_status not in ("active", "blocked"):
-        new_status = "blocked"
+        if new_status not in ("active", "blocked"):
+            new_status = "blocked"
 
-    lic.status = new_status
-    db.session.commit()
-    return redirect(url_for("admin_licenses", message=f"تم تغيير الحالة إلى {new_status}"))
+        lic.status = new_status
+        db.session.commit()
+        return redirect(url_for("admin_licenses", message=f"تم تغيير الحالة إلى {new_status}"))
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/admin/update-max-devices", methods=["POST"])
 @require_auth
 def admin_update_max_devices():
-    license_key = str(request.form.get("license_key", "")).strip()
-
     try:
-        max_devices = int(request.form.get("max_devices", 1))
-    except Exception:
-        return redirect(url_for("admin_licenses", message="عدد الأجهزة غير صحيح"))
+        license_key = str(request.form.get("license_key", "")).strip()
 
-    if max_devices <= 0:
-        return redirect(url_for("admin_licenses", message="عدد الأجهزة يجب أن يكون أكبر من صفر"))
+        try:
+            max_devices = int(request.form.get("max_devices", 1))
+        except Exception:
+            return redirect(url_for("admin_licenses", message="عدد الأجهزة غير صحيح"))
 
-    lic = License.query.filter_by(license_key=license_key).first()
-    if not lic:
-        return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
+        if max_devices <= 0:
+            return redirect(url_for("admin_licenses", message="عدد الأجهزة يجب أن يكون أكبر من صفر"))
 
-    lic.max_devices = max_devices
-    db.session.commit()
-    return redirect(url_for("admin_licenses", message="تم تحديث عدد الأجهزة"))
+        lic = License.query.filter_by(license_key=license_key).first()
+        if not lic:
+            return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
+
+        lic.max_devices = max_devices
+        db.session.commit()
+        return redirect(url_for("admin_licenses", message="تم تحديث عدد الأجهزة"))
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 @app.route("/admin/delete-license", methods=["POST"])
 @require_auth
 def admin_delete_license():
-    license_key = str(request.form.get("license_key", "")).strip()
+    try:
+        license_key = str(request.form.get("license_key", "")).strip()
 
-    lic = License.query.filter_by(license_key=license_key).first()
-    if not lic:
-        return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
+        lic = License.query.filter_by(license_key=license_key).first()
+        if not lic:
+            return redirect(url_for("admin_licenses", message="الترخيص غير موجود"))
 
-    db.session.delete(lic)
-    db.session.commit()
-    return redirect(url_for("admin_licenses", message="تم حذف الترخيص"))
+        db.session.delete(lic)
+        db.session.commit()
+        return redirect(url_for("admin_licenses", message="تم حذف الترخيص"))
+    except Exception as exc:
+        db.session.rollback()
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "trace": traceback.format_exc(),
+        }), 500
 
 
 if __name__ == "__main__":
