@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for, Response
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from functools import wraps
 import os
 import json
@@ -15,7 +15,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# مهم: إجبار SQLAlchemy على استخدام psycopg3
+# استخدام psycopg3 بدل psycopg2
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
@@ -42,7 +42,7 @@ class License(db.Model):
     expire_date = db.Column(db.Date, nullable=True)
     max_devices = db.Column(db.Integer, nullable=False, default=1)
     used_devices = db.Column(db.Integer, nullable=False, default=0)
-    status = db.Column(db.String(32), nullable=False, default="active")  # active, blocked
+    status = db.Column(db.String(32), nullable=False, default="active")
     device_ids = db.Column(db.Text, nullable=False, default="[]")
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
@@ -59,11 +59,11 @@ class License(db.Model):
         clean = []
         seen = set()
         for item in items:
-            text = str(item or "").strip()
-            if not text or text in seen:
+            text_value = str(item or "").strip()
+            if not text_value or text_value in seen:
                 continue
-            seen.add(text)
-            clean.append(text)
+            seen.add(text_value)
+            clean.append(text_value)
         self.device_ids = json.dumps(clean, ensure_ascii=False)
         self.used_devices = len(clean)
 
@@ -75,7 +75,7 @@ class Trial(db.Model):
     device_id = db.Column(db.String(128), unique=True, nullable=False, index=True)
     start_date = db.Column(db.Date, nullable=True)
     expire_date = db.Column(db.Date, nullable=True)
-    status = db.Column(db.String(32), nullable=False, default="trial")  # trial, expired
+    status = db.Column(db.String(32), nullable=False, default="trial")
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
 
@@ -113,36 +113,58 @@ def require_auth(func):
     return wrapper
 
 
+def safe_datetime_text(value):
+    if value is None:
+        return "-"
+
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+
+    return str(value)
+
+
+def safe_date_text(value):
+    if value is None:
+        return "-"
+
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+
+    return str(value)
+
+
 def serialize_license(lic: License):
     return {
         "license_key": lic.license_key,
         "customer_name": lic.customer_name or "",
-        "expire_date": str(lic.expire_date) if lic.expire_date else "-",
+        "expire_date": safe_date_text(lic.expire_date),
         "max_devices": int(lic.max_devices or 1),
         "used_devices": int(lic.used_devices or 0),
         "status": lic.status or "active",
         "device_ids": lic.device_list(),
-        "created_at": lic.created_at.strftime("%Y-%m-%d %H:%M:%S") if lic.created_at else "-",
+        "created_at": safe_datetime_text(lic.created_at),
     }
 
 
 def serialize_trial(trial: Trial):
     return {
         "device_id": trial.device_id,
-        "start_date": str(trial.start_date) if trial.start_date else "-",
-        "expire_date": str(trial.expire_date) if trial.expire_date else "-",
+        "start_date": safe_date_text(trial.start_date),
+        "expire_date": safe_date_text(trial.expire_date),
         "status": trial.status or "trial",
-        "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
+        "created_at": safe_datetime_text(trial.created_at),
     }
 
 
 def migrate_legacy_tables():
-    """
-    يجهز الجداول القديمة لو كانت ناقصة أعمدة.
-    هذا مهم لأنك جرّبت أكثر من نسخة من السيرفر سابقًا.
-    """
     with db.engine.begin() as conn:
-        # licenses table
+        # licenses
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS licenses (
                 id SERIAL PRIMARY KEY,
@@ -186,9 +208,8 @@ def migrate_legacy_tables():
         conn.execute(text("UPDATE licenses SET status = 'active' WHERE status IS NULL"))
         conn.execute(text("UPDATE licenses SET device_ids = '[]' WHERE device_ids IS NULL"))
         conn.execute(text("UPDATE licenses SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_licenses_license_key ON licenses (license_key)"))
 
-        # trials table
+        # trials
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS trials (
                 id SERIAL PRIMARY KEY,
@@ -220,7 +241,6 @@ def migrate_legacy_tables():
 
         conn.execute(text("UPDATE trials SET status = 'trial' WHERE status IS NULL"))
         conn.execute(text("UPDATE trials SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_trials_device_id ON trials (device_id)"))
 
 
 with app.app_context():
@@ -337,11 +357,11 @@ def api_create_license():
             "status": "success",
             "license_key": lic.license_key,
             "customer_name": lic.customer_name,
-            "expire_date": str(lic.expire_date),
+            "expire_date": safe_date_text(lic.expire_date),
             "max_devices": lic.max_devices,
             "used_devices": lic.used_devices,
             "device_ids": lic.device_list(),
-            "created_at": lic.created_at.strftime("%Y-%m-%d %H:%M:%S") if lic.created_at else "-",
+            "created_at": safe_datetime_text(lic.created_at),
         })
     except Exception as exc:
         db.session.rollback()
@@ -374,7 +394,7 @@ def api_check_license():
             return jsonify({
                 "status": "expired",
                 "message": "License expired",
-                "expire_date": str(lic.expire_date),
+                "expire_date": safe_date_text(lic.expire_date),
             }), 403
 
         devices = lic.device_list()
@@ -384,7 +404,7 @@ def api_check_license():
                 "status": "active",
                 "message": "Valid",
                 "customer_name": lic.customer_name,
-                "expire_date": str(lic.expire_date),
+                "expire_date": safe_date_text(lic.expire_date),
                 "max_devices": lic.max_devices,
                 "used_devices": len(devices),
             })
@@ -394,7 +414,7 @@ def api_check_license():
                 "status": "denied",
                 "message": "Device limit reached",
                 "customer_name": lic.customer_name,
-                "expire_date": str(lic.expire_date),
+                "expire_date": safe_date_text(lic.expire_date),
                 "max_devices": lic.max_devices,
                 "used_devices": len(devices),
             }), 403
@@ -407,7 +427,7 @@ def api_check_license():
             "status": "active",
             "message": "Activated",
             "customer_name": lic.customer_name,
-            "expire_date": str(lic.expire_date),
+            "expire_date": safe_date_text(lic.expire_date),
             "max_devices": lic.max_devices,
             "used_devices": lic.used_devices,
         })
@@ -441,7 +461,7 @@ def api_check_device():
                     "message": "Device is activated",
                     "customer_name": lic.customer_name,
                     "license_key": lic.license_key,
-                    "expire_date": str(lic.expire_date),
+                    "expire_date": safe_date_text(lic.expire_date),
                     "max_devices": lic.max_devices,
                     "used_devices": lic.used_devices,
                 })
@@ -485,7 +505,7 @@ def api_start_trial():
             return jsonify({
                 "status": "expired",
                 "message": "Trial expired",
-                "expire_date": str(trial.expire_date),
+                "expire_date": safe_date_text(trial.expire_date),
                 "days_left": 0,
             }), 403
 
@@ -493,10 +513,10 @@ def api_start_trial():
         return jsonify({
             "status": "trial",
             "message": "Trial active",
-            "expire_date": str(trial.expire_date),
+            "expire_date": safe_date_text(trial.expire_date),
             "days_left": days_left,
             "trial_days": TRIAL_DAYS,
-            "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
+            "created_at": safe_datetime_text(trial.created_at),
         })
     except Exception as exc:
         db.session.rollback()
@@ -529,7 +549,7 @@ def api_check_trial():
             return jsonify({
                 "status": "expired",
                 "message": "Trial expired",
-                "expire_date": str(trial.expire_date),
+                "expire_date": safe_date_text(trial.expire_date),
                 "days_left": 0,
             }), 403
 
@@ -537,10 +557,10 @@ def api_check_trial():
         return jsonify({
             "status": "trial",
             "message": "Trial active",
-            "expire_date": str(trial.expire_date),
+            "expire_date": safe_date_text(trial.expire_date),
             "days_left": days_left,
             "trial_days": TRIAL_DAYS,
-            "created_at": trial.created_at.strftime("%Y-%m-%d %H:%M:%S") if trial.created_at else "-",
+            "created_at": safe_datetime_text(trial.created_at),
         })
     except Exception as exc:
         db.session.rollback()
