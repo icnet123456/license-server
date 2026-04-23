@@ -1,29 +1,28 @@
-# CardGenerator License Server for Render
+# License Server
 
-This folder is the GitHub upload package for the online license server only.
+Flask + PostgreSQL license server with:
 
-## Upload these files to a new GitHub repository
-- server.py
-- requirements.txt
-- render.yaml
-- .gitignore
+- online license activation
+- trial devices
+- admin dashboard
+- PostgreSQL persistence
 
-## Deploy on Render
-1. Create a new GitHub repository.
-2. Upload the contents of this folder to that repository root.
-3. In Render, create a new Web Service from that repository.
-4. Render will read render.yaml automatically.
+## Required Environment Variables
 
-## Available endpoints
-- /health
-- /api/meta
-- /api/create-license
-- /api/check-license
-- /api/check-device
-- /api/start-trial
-- /api/check-trial
-- /admin
+- `DATABASE_URL`
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD`
 
-## Notes
-- Do not upload licenses.db if you want a clean new database.
-- The SQLite database file is created automatically on first run.
+## Admin Dashboard
+
+Open:
+
+`/admin/licenses`
+
+## Main APIs
+
+- `POST /api/create-license`
+- `POST /api/check-license`
+- `POST /api/check-device`
+- `POST /api/start-trial`
+- `POST /api/check-trial`
