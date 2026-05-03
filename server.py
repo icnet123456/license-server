@@ -305,7 +305,7 @@ LICENSES_ADMIN_TEMPLATE = """
                         <input type="text" name="customer_name" placeholder="اسم العميل" required>
                     </div>
                     <div>
-                        <input type="number" name="days" placeholder="عدد الأيام" value="30" min="1" required>
+                        <input type="number" name="days" placeholder="عدد الأيام" value="7" min="1" required>
                     </div>
                     <div>
                         <input type="number" name="max_devices" placeholder="عدد الأجهزة" value="1" min="1" required>
