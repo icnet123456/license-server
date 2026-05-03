@@ -7,6 +7,17 @@ import uuid
 
 app = Flask(__name__)
 DB_NAME = "licenses.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+PH = "%s" if DATABASE_URL else "?"
+
+
+def get_conn():
+    if DATABASE_URL:
+        import psycopg
+        return psycopg.connect(DATABASE_URL)
+    return sqlite3.connect(DB_NAME)
+
+
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 API_VERSION = "1.1.0"
 DEPLOY_ENV = os.getenv("RENDER_ENVIRONMENT", "local")
@@ -392,11 +403,15 @@ LICENSES_ADMIN_TEMPLATE = """
 
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    if DATABASE_URL:
+        pk = "SERIAL PRIMARY KEY"
+    else:
+        pk = "INTEGER PRIMARY KEY AUTOINCREMENT"
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS licenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk},
             license_key TEXT UNIQUE NOT NULL,
             customer_name TEXT,
             device_ids TEXT,
@@ -406,9 +421,9 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS trials (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk},
             device_id TEXT UNIQUE NOT NULL,
             status TEXT NOT NULL,
             expire_date TEXT NOT NULL,
@@ -447,12 +462,12 @@ def normalize_device_ids(raw_device_id=None, raw_device_ids=None):
 
 
 def get_license(license_key):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
         FROM licenses
-        WHERE license_key = ?
+        WHERE license_key = {PH}
     """, (license_key,))
     row = cur.fetchone()
     conn.close()
@@ -460,7 +475,7 @@ def get_license(license_key):
 
 
 def get_all_licenses():
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
@@ -486,13 +501,13 @@ def find_license_by_device(device_id):
 
 
 def get_trial(device_id):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT device_id, status, expire_date, created_at
         FROM trials
-        WHERE device_id = ?
+        WHERE device_id = {PH}
         """,
         (device_id,),
     )
@@ -504,12 +519,12 @@ def get_trial(device_id):
 def create_trial(device_id, days=TRIAL_DAYS):
     expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
     created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         INSERT INTO trials (device_id, status, expire_date, created_at)
-        VALUES (?, ?, ?, ?)
+        VALUES ({PH}, {PH}, {PH}, {PH})
         """,
         (device_id, "active", expire_date, created_at),
     )
@@ -537,52 +552,52 @@ def serialize_license_row(row):
 
 
 def save_device_ids(license_key, device_ids):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         UPDATE licenses
-        SET device_ids = ?
-        WHERE license_key = ?
+        SET device_ids = {PH}
+        WHERE license_key = {PH}
     """, (json.dumps(device_ids), license_key))
     conn.commit()
     conn.close()
 
 
 def update_license_status(license_key, new_status):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         UPDATE licenses
-        SET status = ?
-        WHERE license_key = ?
+        SET status = {PH}
+        WHERE license_key = {PH}
     """, (new_status, license_key))
     conn.commit()
     conn.close()
 
 
 def update_max_devices_value(license_key, max_devices):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         UPDATE licenses
-        SET max_devices = ?
-        WHERE license_key = ?
+        SET max_devices = {PH}
+        WHERE license_key = {PH}
     """, (max_devices, license_key))
     conn.commit()
     conn.close()
 
 
 def delete_license(license_key):
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM licenses WHERE license_key = ?", (license_key,))
+    cur.execute(f"DELETE FROM licenses WHERE license_key = {PH}", (license_key,))
     conn.commit()
     conn.close()
 
 
 def check_database_health():
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_conn()
         cur = conn.cursor()
         cur.execute("SELECT 1")
         cur.fetchone()
@@ -664,12 +679,12 @@ def api_create_license():
     expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
     created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         INSERT INTO licenses (
             license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
     """, (
         license_key,
         customer_name,
@@ -927,12 +942,12 @@ def admin_create_license():
     expire_date = (datetime.today() + timedelta(days=days)).strftime("%Y-%m-%d")
     created_at = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_conn()
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         INSERT INTO licenses (
             license_key, customer_name, device_ids, max_devices, status, expire_date, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES ({PH}, {PH}, {PH}, {PH}, {PH}, {PH}, {PH})
     """, (
         license_key,
         customer_name,
